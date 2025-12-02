@@ -13,6 +13,7 @@ import time
 import os
 import numpy as np
 import sys
+from computation import TrajectoryCalculator
 
 # Import motor controller
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -399,11 +400,15 @@ def run_program_mode(cap, motor_controller=None):
     """
     display_available = has_display()
     
+    # Initialize trajectory calculator
+    trajectory_calc = TrajectoryCalculator(motor_controller)
+    
     print("\n" + "="*60)
     print("AIR HOCKEY ROBOT - DETECTION MODE")
     print("="*60)
     print(f"Display Mode: {'Live Video + Detection' if display_available else 'Headless Detection'}")
     print(f"Motor Controller: {'Connected' if motor_controller else 'Not Connected'}")
+    print(f"Trajectory Calculator: Initialized")
     print(f"Detection: Black objects (puck tracking)")
     
     if display_available:
@@ -415,8 +420,37 @@ def run_program_mode(cap, motor_controller=None):
     print("="*60)
     
     window_name = "Air Hockey Robot - Puck Detection"
+    
+    # ===== MEASURE ACTUAL CAMERA FPS =====
+    print("\nMeasuring camera FPS...")
+    test_frames = 30
+    start_time = time.time()
+    for _ in range(test_frames):
+        ret, _ = cap.read()
+        if not ret:
+            break
+    measured_fps = test_frames / (time.time() - start_time)
+    print(f"Camera FPS: {measured_fps:.1f}")
+    
+    # ===== CALCULATE OPTIMAL FRAME SKIP =====
+    TARGET_PROCESSING_FPS = 10  # Process at 10 FPS for good tracking
+    
+    if measured_fps < 5:
+        PROCESS_EVERY_N_FRAMES = 1  # Process all frames (camera is slow)
+        print("Camera is slow - processing every frame")
+    elif measured_fps < 15:
+        PROCESS_EVERY_N_FRAMES = 1
+        print("Processing every frame")
+    elif measured_fps < 25:
+        PROCESS_EVERY_N_FRAMES = 2  # Process every 2nd frame
+        print(f"Processing every 2nd frame (~{measured_fps/2:.1f} FPS)")
+    else:
+        PROCESS_EVERY_N_FRAMES = int(measured_fps / TARGET_PROCESSING_FPS)
+        print(f"Processing every {PROCESS_EVERY_N_FRAMES} frames (~{measured_fps/PROCESS_EVERY_N_FRAMES:.1f} FPS)")
+    
     frame_count = 0
     detection_count = 0
+    interception_count = 0
     
     try:
         while True:
@@ -432,22 +466,43 @@ def run_program_mode(cap, motor_controller=None):
             # Detect black objects
             detections, annotated_frame = detect_black_objects(frame)
             
-            # Print detections to terminal
+            # Process detections with trajectory calculator
             if detections:
                 detection_count += 1
-                print(f"\n[FRAME {frame_count}] DETECTED {len(detections)} BLACK OBJECT(S):")
-                for i, det in enumerate(detections):
-                    x, y = det['center']
-                    area = det['area']
-                    print(f"  Object {i+1}: Position=({x}, {y}), Area={int(area)} pixels")
+                
+                # Use largest detection (most likely the puck)
+                largest_detection = max(detections, key=lambda d: d['area'])
+                
+                print(f"\n[FRAME {frame_count}] PUCK DETECTED:")
+                x, y = largest_detection['center']
+                area = largest_detection['area']
+                print(f"  Position: ({x}, {y}) px, Area: {int(area)} px²")
+                
+                # Process with trajectory calculator
+                result = trajectory_calc.process_detection(largest_detection)
+                
+                if result:
+                    interception_count += 1
+                    print(f"  Puck Position: ({result['puck_position'][0]:.1f}, {result['puck_position'][1]:.1f}) mm")
+                    print(f"  Puck Velocity: ({result['puck_velocity'][0]:.1f}, {result['puck_velocity'][1]:.1f}) mm/s")
+                    print(f"  Intercept Point: ({result['intercept_point'][0]:.1f}, {result['intercept_point'][1]:.1f}) mm")
+                    print(f"  Time to Intercept: {result['time_to_intercept']:.3f} s")
+                    print(f"  Command Sent: {result['command_sent']}")
             
             # Show video if display available
             if display_available:
                 # Add frame info overlay
-                cv2.putText(annotated_frame, f"Frame: {frame_count} | Detections: {detection_count}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.putText(annotated_frame, f"Frame: {frame_count} | Detections: {detection_count} | Interceptions: {interception_count}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(annotated_frame, f"Objects in View: {len(detections)}", 
-                           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                           (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                # Show robot status
+                status = trajectory_calc.get_status()
+                if status['robot_position']:
+                    cv2.putText(annotated_frame, f"Robot: ({status['robot_position'][0]:.0f}, {status['robot_position'][1]:.0f}) mm", 
+                               (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 255), 2)
+                
                 cv2.putText(annotated_frame, "Press 'q' to quit", 
                            (10, annotated_frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
@@ -455,15 +510,16 @@ def run_program_mode(cap, motor_controller=None):
                 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
-                    print(f"\nProgram stopped. Processed {frame_count} frames, {detection_count} detections.")
+                    print(f"\nProgram stopped. Frames: {frame_count}, Detections: {detection_count}, Interceptions: {interception_count}")
                     break
             
             time.sleep(0.01)  # Small delay
             
     except KeyboardInterrupt:
-        print(f"\nProgram stopped. Processed {frame_count} frames, {detection_count} detections.")
+        print(f"\nProgram stopped. Frames: {frame_count}, Detections: {detection_count}, Interceptions: {interception_count}")
     
     finally:
+        trajectory_calc.stop_motors()
         if display_available:
             cv2.destroyWindow(window_name)
 
