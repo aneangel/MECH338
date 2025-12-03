@@ -218,13 +218,13 @@ def test_live_mode():
     
     # Initialize motor controller
     print("\n[CONNECTING TO ESP32]")
-    motor_controller = MotorController(port='/dev/ttyACM0', baudrate=115200)
+    motor_controller = MotorController()  # Remove port='/dev/ttyACM0'
     
     if not motor_controller.connect():
         print("ERROR: Failed to connect to ESP32!")
         print("Make sure:")
         print("  1. ESP32 is connected via USB")
-        print("  2. Port is /dev/ttyACM0 (or update in sense.py)")
+        print("  2. Port is /dev/ttyACM1 (or update in sense.py)")
         print("  3. ESP32 code is uploaded and running")
         cap.release()
         return
@@ -345,7 +345,7 @@ def test_motor_only():
     print("MOTOR CONTROLLER TEST")
     print("="*70)
     
-    controller = MotorController(port='/dev/ttyACM0')
+    controller = MotorController(port='/dev/ttyACM1')
     
     if not controller.connect():
         print("ERROR: Failed to connect to ESP32")
