@@ -38,6 +38,11 @@ from flask import Flask, Response
 
 def find_motor_controller():
     """Find XIAO RP2350 motor controller."""
+    # MANUAL OVERRIDE: Set to specific port if you have multiple RP2350s
+    # Uncomment one of these if auto-detect picks the wrong one:
+    return "/dev/ttyACM0"
+    # return "/dev/ttyACM2"
+    
     ports = serial.tools.list_ports.comports()
     for port in ports:
         if port.vid == 0x2886 and port.pid == 0x58:
@@ -58,6 +63,12 @@ class PuckTracker:
         self.CROP_REGION = None  # (x1, y1, x2, y2) in original frame
         self.use_crop = False  # Enable cropping to zoom on table
         self.crop_padding = 20  # Extra pixels around detected table for context
+        
+        # Manual workspace boundary (robot's defense zone - left half of table)
+        # Set to None to use auto-detection, or (x1, y1, x2, y2) for fixed boundary
+        # These values are for the robot's reachable workspace on the table
+        self.MANUAL_BOUNDARY = (145, 95, 620, 610)  # Left half of table (x1, y1, x2, y2)
+        self.use_manual_boundary = True  # Set to True to use fixed boundary
         
         # HSV color ranges for red puck
         self.RED_LOWER1 = np.array([0, 100, 100])
@@ -151,61 +162,57 @@ class PuckTracker:
         if not self.initialize_camera():
             return False
         
-        # Detect table boundary on startup
-        print("Detecting table boundary...")
         image = sl.Mat()
         frame_w, frame_h = 1280, 720  # Default
         
-        for attempt in range(10):  # Try a few frames
-            if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
-                self.zed.retrieve_image(image, sl.VIEW.RIGHT)
-                frame = image.get_data()[:, :, :3]
-                
-                # Use full frame for boundary detection
-                frame_h, frame_w = frame.shape[:2]
-                print(f"  Frame size: {frame_w}x{frame_h}")
-                
-                boundary = self.detect_table_boundary(frame)
-                if boundary:
-                    # boundary is the table surface with safety margin already applied
-                    x_min, y_min, x_max, y_max = boundary
-                    
-                    # Set crop region slightly larger than boundary for context
-                    crop_x1 = max(0, x_min - self.crop_padding - self.boundary_margin)
-                    crop_y1 = max(0, y_min - self.crop_padding - self.boundary_margin)
-                    crop_x2 = min(frame_w, x_max + self.crop_padding + self.boundary_margin)
-                    crop_y2 = min(frame_h, y_max + self.crop_padding + self.boundary_margin)
-                    self.CROP_REGION = (crop_x1, crop_y1, crop_x2, crop_y2)
-                    
-                    # Virtual boundary in cropped frame coordinates
-                    self.virtual_boundary = (
-                        x_min - crop_x1,  # Offset to cropped frame
-                        y_min - crop_y1,
-                        x_max - crop_x1,
-                        y_max - crop_y1
-                    )
-                    
-                    print(f"✓ Table detected in frame: ({x_min}, {y_min}) to ({x_max}, {y_max})")
-                    print(f"  Crop region: ({crop_x1}, {crop_y1}) to ({crop_x2}, {crop_y2})")
-                    print(f"  Cropped size: {crop_x2-crop_x1}x{crop_y2-crop_y1} pixels")
-                    print(f"  Virtual boundary (in crop): {self.virtual_boundary}")
-                    break
-                else:
-                    print(f"  Attempt {attempt + 1}/10: No boundary detected")
-            time.sleep(0.1)
+        # Get frame dimensions
+        if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
+            self.zed.retrieve_image(image, sl.VIEW.RIGHT)
+            frame = image.get_data()[:, :, :3]
+            frame_h, frame_w = frame.shape[:2]
+            print(f"Frame size: {frame_w}x{frame_h}")
         
-        if self.CROP_REGION is None:
-            print("⚠ Warning: Could not detect table boundary. Using full frame.")
-            self.use_crop = False
-            # Get frame dimensions
-            if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
-                self.zed.retrieve_image(image, sl.VIEW.RIGHT)
-                frame = image.get_data()[:, :, :3]
-                h, w = frame.shape[:2]
+        # === USE MANUAL BOUNDARY (robot's workspace on left half of table) ===
+        if self.use_manual_boundary and self.MANUAL_BOUNDARY:
+            x_min, y_min, x_max, y_max = self.MANUAL_BOUNDARY
+            self.virtual_boundary = (x_min, y_min, x_max, y_max)
+            print(f"Using manual workspace boundary: ({x_min}, {y_min}) to ({x_max}, {y_max})")
+            print(f"  Workspace size: {x_max-x_min}x{y_max-y_min} pixels")
+        else:
+            # === AUTO-DETECT TABLE BOUNDARY ===
+            print("Detecting table boundary...")
+            
+            for attempt in range(10):
+                if self.zed.grab(self.runtime_params) == sl.ERROR_CODE.SUCCESS:
+                    self.zed.retrieve_image(image, sl.VIEW.RIGHT)
+                    frame = image.get_data()[:, :, :3]
+                    
+                    boundary = self.detect_table_boundary(frame)
+                    if boundary:
+                        x_min, y_min, x_max, y_max = boundary
+                        
+                        # Set crop region slightly larger than boundary for context
+                        crop_x1 = max(0, x_min - self.crop_padding - self.boundary_margin)
+                        crop_y1 = max(0, y_min - self.crop_padding - self.boundary_margin)
+                        crop_x2 = min(frame_w, x_max + self.crop_padding + self.boundary_margin)
+                        crop_y2 = min(frame_h, y_max + self.crop_padding + self.boundary_margin)
+                        self.CROP_REGION = (crop_x1, crop_y1, crop_x2, crop_y2)
+                        
+                        # Virtual boundary in frame coordinates (no cropping)
+                        self.virtual_boundary = (x_min, y_min, x_max, y_max)
+                        
+                        print(f"Table detected: ({x_min}, {y_min}) to ({x_max}, {y_max})")
+                        break
+                    else:
+                        print(f"  Attempt {attempt + 1}/10: No boundary detected")
+                time.sleep(0.1)
+            
+            if self.virtual_boundary is None:
+                print("Warning: Could not detect table boundary. Using full frame.")
                 self.virtual_boundary = (self.boundary_margin, self.boundary_margin, 
-                                        w - self.boundary_margin, h - self.boundary_margin)
-                print(f"  Using full frame boundary: {self.virtual_boundary}")
+                                        frame_w - self.boundary_margin, frame_h - self.boundary_margin)
         
+        # Start tracking thread
         self.running = True
         self.thread = threading.Thread(target=self._tracking_loop, daemon=True)
         self.thread.start()
@@ -313,12 +320,12 @@ class PuckTracker:
         return None
     
     def detect_table_boundary(self, frame):
-        """Detect table surface to establish virtual boundary.
+        """Detect table playing surface bounded by black edges.
         
-        Uses multiple approaches to robustly detect the playing surface:
-        1. Color-based detection for tan/cream table
-        2. Glare filtering to handle warehouse lights
-        3. Rectangular fitting for clean boundaries
+        Strategy:
+        1. Find the black rectangular border around the table
+        2. The playing surface is inside that border
+        3. Erode slightly to get the actual playing area
         
         Args:
             frame: BGR image from camera
@@ -327,131 +334,175 @@ class PuckTracker:
             tuple: (x_min, y_min, x_max, y_max) boundary in pixels, or None
         """
         h, w = frame.shape[:2]
-        
-        # Convert to HSV for color detection
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # === METHOD 1: Color-based detection ===
-        # Detect tan/cream/beige table surface
-        mask_color = cv2.inRange(hsv, self.TABLE_LOWER, self.TABLE_UPPER)
+        # === METHOD 1: Find black border, then get inner area ===
+        # The table has a distinct black border - find it first
         
-        # Also detect lighter areas (cream/white) that aren't glare
-        # Glare = high value + very low saturation
-        # Table = high value + some saturation (tan/cream tint)
-        light_lower = np.array([0, 10, 150])  # Any hue, low sat, bright
-        light_upper = np.array([180, 80, 250])  # But not pure white glare
-        mask_light = cv2.inRange(hsv, light_lower, light_upper)
+        # Detect the tan/cream playing surface (not black, not too bright)
+        # Table surface: tan/cream color, medium brightness
+        table_mask = cv2.inRange(hsv, 
+                                  np.array([10, 15, 100]),   # Low: tan hue, some sat, medium value
+                                  np.array([50, 150, 245]))  # High: yellow-ish, not too saturated, not glare
         
-        # Combine color masks
-        mask = cv2.bitwise_or(mask_color, mask_light)
+        # Remove glare spots
+        glare = cv2.inRange(hsv, np.array([0, 0, 245]), np.array([180, 40, 255]))
+        table_mask = cv2.bitwise_and(table_mask, cv2.bitwise_not(glare))
         
-        # === FILTER OUT GLARE ===
-        # Glare is very bright (high V) with very low saturation (near white)
-        glare_mask = cv2.inRange(hsv, 
-                                  np.array([0, 0, self.GLARE_VALUE_THRESHOLD]),
-                                  np.array([180, self.GLARE_SAT_THRESHOLD, 255]))
-        # Remove glare from detection
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(glare_mask))
-        
-        # === ALSO EXCLUDE BLACK EDGES ===
-        # Black edges of table have low value
-        black_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 50]))
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(black_mask))
-        
-        # === CLEAN UP MASK ===
-        kernel_small = np.ones((5, 5), np.uint8)
-        kernel_large = np.ones((15, 15), np.uint8)
-        
-        # Remove noise
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=2)
-        # Fill holes
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large, iterations=3)
-        # Dilate to connect nearby regions
-        mask = cv2.dilate(mask, kernel_small, iterations=2)
+        # Clean up - close small gaps, remove noise
+        kernel = np.ones((7, 7), np.uint8)
+        table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_CLOSE, kernel, iterations=3)
+        table_mask = cv2.morphologyEx(table_mask, cv2.MORPH_OPEN, kernel, iterations=2)
         
         # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(table_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            print("  No table surface detected")
-            return self._fallback_boundary_detection(frame)
+            print("  No table surface found")
+            return self._detect_by_black_border(frame)
         
-        # Find the largest rectangular-ish contour
-        min_area = (w * h) * 0.15  # Table should be at least 15% of frame
+        # Find the largest contour that's reasonably rectangular
+        min_area = (w * h) * 0.2  # Table should be at least 20% of frame
         best_contour = None
-        best_score = 0
+        best_rect_score = 0
         
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < min_area:
                 continue
             
-            # Get rotated rectangle to check how rectangular it is
+            # Approximate contour to polygon
+            epsilon = 0.02 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, epsilon, True)
+            
+            # Get minimum area rectangle
             rect = cv2.minAreaRect(cnt)
-            box = cv2.boxPoints(rect)
             rect_area = rect[1][0] * rect[1][1]
             
             if rect_area == 0:
                 continue
             
-            # Score = area * rectangularity (how well contour fills its bounding rect)
+            # Rectangularity score
             rectangularity = area / rect_area
-            score = area * rectangularity
             
-            # Prefer larger, more rectangular contours
-            if score > best_score and rectangularity > 0.7:
-                best_score = score
+            # Prefer contours that are large and rectangular
+            score = area * rectangularity
+            if score > best_rect_score and rectangularity > 0.75:
+                best_rect_score = score
                 best_contour = cnt
         
         if best_contour is None:
-            print(f"  No rectangular contour found (need >{min_area:.0f} px, >70% fill)")
-            return self._fallback_boundary_detection(frame)
+            print("  No rectangular table surface found")
+            return self._detect_by_black_border(frame)
         
-        # Get bounding rectangle
-        x, y, w_rect, h_rect = cv2.boundingRect(best_contour)
+        # Use minimum area rectangle for cleaner boundaries
+        rect = cv2.minAreaRect(best_contour)
+        box = cv2.boxPoints(rect)
+        box = np.intp(box)
         
-        # Apply safety margin
-        x_min = x + self.boundary_margin
-        y_min = y + self.boundary_margin
-        x_max = x + w_rect - self.boundary_margin
-        y_max = y + h_rect - self.boundary_margin
+        # Get axis-aligned bounding box from the rotated rect
+        x_coords = box[:, 0]
+        y_coords = box[:, 1]
+        
+        x_min = int(np.min(x_coords))
+        x_max = int(np.max(x_coords))
+        y_min = int(np.min(y_coords))
+        y_max = int(np.max(y_coords))
+        
+        # Clamp to frame
+        x_min = max(0, x_min)
+        y_min = max(0, y_min)
+        x_max = min(w, x_max)
+        y_max = min(h, y_max)
+        
+        # Apply inward margin (the detected surface might include a bit of the black edge)
+        margin = self.boundary_margin + 5  # Extra 5px inward
+        x_min += margin
+        y_min += margin
+        x_max -= margin
+        y_max -= margin
         
         # Sanity check
-        if (x_max - x_min) < 100 or (y_max - y_min) < 50:
+        if (x_max - x_min) < 200 or (y_max - y_min) < 100:
             print(f"  Boundary too small: {x_max-x_min}x{y_max-y_min}")
-            return self._fallback_boundary_detection(frame)
+            return self._detect_by_black_border(frame)
         
-        area = cv2.contourArea(best_contour)
-        print(f"  Table detected: {w_rect}x{h_rect} px ({100*area/(w*h):.1f}% of frame)")
-        
+        print(f"  Table surface: {x_max-x_min}x{y_max-y_min} px")
         return (x_min, y_min, x_max, y_max)
     
-    def _fallback_boundary_detection(self, frame):
-        """Fallback: use edge detection to find table boundary."""
-        print("  Trying edge-based fallback...")
+    def _detect_by_black_border(self, frame):
+        """Fallback: detect the black rectangular border around table."""
+        print("  Trying black border detection...")
         
         h, w = frame.shape[:2]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         
-        # Convert to grayscale
+        # Detect black areas (the border)
+        black_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 60]))
+        
+        # Clean up
+        kernel = np.ones((5, 5), np.uint8)
+        black_mask = cv2.morphologyEx(black_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Find contours in the black mask
+        contours, _ = cv2.findContours(black_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return self._edge_fallback(frame)
+        
+        # Find the largest black rectangular shape (the table border)
+        min_area = (w * h) * 0.15
+        best_contour = None
+        max_area = 0
+        
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area > max_area and area > min_area:
+                # Check if it's rectangular
+                rect = cv2.minAreaRect(cnt)
+                rect_area = rect[1][0] * rect[1][1]
+                if rect_area > 0 and area / rect_area > 0.5:
+                    max_area = area
+                    best_contour = cnt
+        
+        if best_contour is None:
+            return self._edge_fallback(frame)
+        
+        # Get bounding rect and shrink inward (we want the inside)
+        x, y, w_rect, h_rect = cv2.boundingRect(best_contour)
+        
+        # The playing surface is inside the black border
+        # Estimate border thickness and subtract
+        border_thickness = 25  # Approximate black border width
+        
+        x_min = x + border_thickness
+        y_min = y + border_thickness  
+        x_max = x + w_rect - border_thickness
+        y_max = y + h_rect - border_thickness
+        
+        if (x_max - x_min) > 200 and (y_max - y_min) > 100:
+            print(f"  Found via black border: {x_max-x_min}x{y_max-y_min} px")
+            return (x_min, y_min, x_max, y_max)
+        
+        return self._edge_fallback(frame)
+    
+    def _edge_fallback(self, frame):
+        """Last resort: edge detection."""
+        print("  Edge detection fallback...")
+        
+        h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Blur to reduce noise
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        
-        # Edge detection
         edges = cv2.Canny(blurred, 50, 150)
         
-        # Dilate to connect edges
         kernel = np.ones((3, 3), np.uint8)
         edges = cv2.dilate(edges, kernel, iterations=2)
         
-        # Find contours
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
             return None
         
-        # Find largest rectangular contour
         min_area = (w * h) * 0.1
         best_rect = None
         max_area = 0
@@ -460,19 +511,13 @@ class PuckTracker:
             area = cv2.contourArea(cnt)
             if area > max_area and area > min_area:
                 x, y, w_rect, h_rect = cv2.boundingRect(cnt)
-                # Check aspect ratio is reasonable (table is wider than tall)
                 if w_rect > h_rect * 0.8 and w_rect > w * 0.3:
                     max_area = area
-                    best_rect = (x, y, x + w_rect, y + h_rect)
+                    best_rect = (x + 20, y + 20, x + w_rect - 20, y + h_rect - 20)
         
         if best_rect:
-            x_min, y_min, x_max, y_max = best_rect
-            x_min += self.boundary_margin
-            y_min += self.boundary_margin
-            x_max -= self.boundary_margin
-            y_max -= self.boundary_margin
-            print(f"  Fallback found boundary: {x_max-x_min}x{y_max-y_min} px")
-            return (x_min, y_min, x_max, y_max)
+            print(f"  Edge fallback: {best_rect[2]-best_rect[0]}x{best_rect[3]-best_rect[1]} px")
+            return best_rect
         
         return None
     
@@ -575,6 +620,8 @@ class PuckTracker:
                     # Draw virtual boundary
                     if self.virtual_boundary:
                         x_min, y_min, x_max, y_max = self.virtual_boundary
+                        # Convert to int for OpenCV
+                        x_min, y_min, x_max, y_max = int(x_min), int(y_min), int(x_max), int(y_max)
                         cv2.rectangle(preview_frame, (x_min, y_min), (x_max, y_max), (255, 255, 0), 2)
                         cv2.putText(preview_frame, "Virtual Boundary", (x_min + 5, y_min + 20), 
                                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
@@ -686,8 +733,12 @@ class PuckTracker:
         """Convert camera pixel coordinates to workspace mm coordinates.
         
         The camera's virtual boundary (table surface) maps to the motor's
-        workspace limits. This provides the coordinate transform between
-        what the camera sees and where the motors can move.
+        workspace limits from sensorless homing (ground truth).
+        
+        COORDINATE SYSTEMS:
+        - Camera: (0,0) top-left, X increases right, Y increases DOWN
+        - Motor:  (0,0) bottom-left, X increases right, Y increases UP
+        - So Y axis is INVERTED between camera and motor
         
         Args:
             cam_x: Camera X coordinate (pixels, in cropped/boundary frame)
@@ -708,15 +759,29 @@ class PuckTracker:
             frame_width = 1280
             frame_height = 720
         
-        # Get workspace dimensions (from motor controller after homing)
-        ws_x_range = getattr(self, 'workspace_x_max', 70.0) - getattr(self, 'workspace_x_min', 0.0)
-        ws_y_range = getattr(self, 'workspace_y_max', 35.0) - getattr(self, 'workspace_y_min', 0.0)
-        ws_x_min = getattr(self, 'workspace_x_min', 0.0)
-        ws_y_min = getattr(self, 'workspace_y_min', 0.0)
+        # Use workspace limits from sensorless homing (GROUND TRUTH - no defaults!)
+        ws_x_min = getattr(self, 'workspace_x_min', None)
+        ws_x_max = getattr(self, 'workspace_x_max', None)
+        ws_y_min = getattr(self, 'workspace_y_min', None)
+        ws_y_max = getattr(self, 'workspace_y_max', None)
+        
+        # If not homed, return None (can't map coordinates)
+        if ws_x_max is None or ws_y_max is None:
+            return None, None
+        
+        ws_x_range = ws_x_max - ws_x_min
+        ws_y_range = ws_y_max - ws_y_min
         
         # Map camera pixels to workspace mm
+        # X: camera left (0) = motor X_min, camera right = motor X_max
         workspace_x = ws_x_min + (cam_x / frame_width) * ws_x_range
-        workspace_y = ws_y_min + (cam_y / frame_height) * ws_y_range
+        
+        # Y: INVERTED - camera top (0) = motor Y_max, camera bottom = motor Y_min
+        workspace_y = ws_y_max - (cam_y / frame_height) * ws_y_range
+        
+        # Clamp to workspace limits
+        workspace_x = max(ws_x_min, min(ws_x_max, workspace_x))
+        workspace_y = max(ws_y_min, min(ws_y_max, workspace_y))
         
         return workspace_x, workspace_y
     
@@ -779,21 +844,38 @@ class PuckTracker:
             return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
         
         def run_flask():
-            # Suppress Flask logs
+            # Completely suppress Flask/werkzeug output
             import logging
+            import os
+            
+            # Disable all Flask logging
             log = logging.getLogger('werkzeug')
-            log.setLevel(logging.ERROR)
+            log.setLevel(logging.CRITICAL)
+            log.disabled = True
+            
+            # Also disable Flask's own logger
+            self.flask_app.logger.disabled = True
+            logging.getLogger('flask').setLevel(logging.CRITICAL)
+            
+            # Redirect stderr temporarily during startup
+            import sys
+            old_stderr = sys.stderr
+            sys.stderr = open(os.devnull, 'w')
             
             try:
-                self.flask_app.run(host='0.0.0.0', port=self.stream_port, threaded=True, use_reloader=False)
+                self.flask_app.run(host='0.0.0.0', port=self.stream_port, 
+                                  threaded=True, use_reloader=False)
             except Exception as e:
-                print(f"Flask server error: {e}")
+                pass  # Silently handle errors
+            finally:
+                sys.stderr = old_stderr
         
         self.flask_thread = threading.Thread(target=run_flask, daemon=True)
         self.flask_thread.start()
         
-        print(f"Stream server started at http://0.0.0.0:{self.stream_port}")
-        print("Open this URL in a browser to view the camera feed")
+        # Give Flask a moment to start
+        time.sleep(0.1)
+        print(f"Stream: http://0.0.0.0:{self.stream_port}")
     
     def stop_stream_server(self):
         """Stop Flask streaming server."""
@@ -811,7 +893,7 @@ class PuckTracker:
         """Get puck position and velocity in workspace coordinates (mm).
         
         Returns:
-            tuple: ((x_mm, y_mm), (vx_mm_s, vy_mm_s)) or (None, None) if not visible
+            tuple: ((x_mm, y_mm), (vx_mm_s, vy_mm_s)) or (None, None) if not visible or not homed
         """
         pos, vel = self.get_puck_state()
         
@@ -819,10 +901,13 @@ class PuckTracker:
             return None, None
         
         # Convert pixel position to workspace mm
-        px_mm, py_mm = self.camera_to_workspace(pos[0], pos[1])
+        result = self.camera_to_workspace(pos[0], pos[1])
+        if result[0] is None:
+            return None, None  # Not homed yet
+        px_mm, py_mm = result
         
         # Convert pixel velocity to workspace velocity (mm/s)
-        # Scale velocity by the same ratio as position
+        # Scale velocity by the same ratio as position (using HOMING values)
         if self.virtual_boundary:
             x_min, y_min, x_max, y_max = self.virtual_boundary
             frame_width = x_max - x_min
@@ -831,9 +916,17 @@ class PuckTracker:
             frame_width = 1280
             frame_height = 720
         
+        # Get workspace dimensions from homing (GROUND TRUTH)
+        ws_x_range = getattr(self, 'workspace_x_max', 0) - getattr(self, 'workspace_x_min', 0)
+        ws_y_range = getattr(self, 'workspace_y_max', 0) - getattr(self, 'workspace_y_min', 0)
+        
+        if ws_x_range <= 0 or ws_y_range <= 0:
+            return None, None  # Not homed yet
+        
         # Velocity scaling: pixels/frame -> mm/s (assuming ~60fps)
-        vx_mm = (vel[0] / frame_width) * 70.0 * 60.0
-        vy_mm = (vel[1] / frame_height) * 35.0 * 60.0
+        # Y is inverted (camera Y down = motor Y up)
+        vx_mm = (vel[0] / frame_width) * ws_x_range * 60.0
+        vy_mm = -(vel[1] / frame_height) * ws_y_range * 60.0  # Invert Y
         
         return (px_mm, py_mm), (vx_mm, vy_mm)
     
@@ -841,13 +934,17 @@ class PuckTracker:
         """Get paddle position in workspace coordinates (mm).
         
         Returns:
-            tuple: (x_mm, y_mm) or None if not visible
+            tuple: (x_mm, y_mm) or None if not visible or not homed
         """
         pos = self.get_paddle_position()
         if pos is None:
             return None
         
-        return self.camera_to_workspace(pos[0], pos[1])
+        result = self.camera_to_workspace(pos[0], pos[1])
+        # camera_to_workspace returns (None, None) if not homed
+        if result[0] is None:
+            return None
+        return result
 
 
 class MotorController:
@@ -907,6 +1004,12 @@ class MotorController:
                     if line:
                         try:
                             resp = json.loads(line)
+                            
+                            # Handle debug messages separately
+                            if resp.get('debug') == 'motion':
+                                self._print_debug_motion(resp)
+                                continue  # Keep waiting for actual response
+                            
                             # Update internal state
                             self.current_x = resp.get('x', self.current_x)
                             self.current_y = resp.get('y', self.current_y)
@@ -919,6 +1022,19 @@ class MotorController:
         except Exception as e:
             print(f"Command error: {e}")
             return None
+    
+    def _print_debug_motion(self, msg):
+        """Print formatted debug motion message."""
+        x = msg.get('x', 0)
+        y = msg.get('y', 0)
+        vx = msg.get('vx', 0)
+        vy = msg.get('vy', 0)
+        speed = msg.get('speed', 0)
+        dir_str = msg.get('dir', '')
+        x_max = msg.get('x_max', 0)
+        y_max = msg.get('y_max', 0)
+        
+        print(f"  [DBG] pos=({x:.1f},{y:.1f}) vel=({vx:.0f},{vy:.0f}) speed={speed:.0f} {dir_str} | limits: X[0-{x_max:.0f}] Y[0-{y_max:.0f}]")
     
     def enable(self):
         """Enable motors."""
@@ -1055,16 +1171,39 @@ class MotorController:
         """Stop all motion."""
         self.send_cmd({"cmd": "stop"})
     
-    def camera_guided_home(self, tracker):
-        """Camera-guided homing - uses vision to navigate to corners safely.
+    def set_debug_stream(self, enabled):
+        """Enable/disable debug streaming from Arduino."""
+        resp = self.send_cmd({"cmd": "stream", "state": enabled})
+        if resp and resp.get('status') == 'ok':
+            print(f"Debug streaming: {'ON' if enabled else 'OFF'}")
+            return True
+        return False
+    
+    def set_workspace(self, x_min, x_max, y_min, y_max):
+        """Set workspace limits on Arduino (syncs with homing results)."""
+        resp = self.send_cmd({
+            "cmd": "set_workspace",
+            "x_min": x_min,
+            "x_max": x_max,
+            "y_min": y_min,
+            "y_max": y_max
+        })
+        if resp and resp.get('status') == 'ok':
+            self.workspace_limits = {
+                'x_min': x_min, 'x_max': x_max,
+                'y_min': y_min, 'y_max': y_max
+            }
+            self.homed = True
+            print(f"Workspace synced: X[{x_min:.1f}-{x_max:.1f}] Y[{y_min:.1f}-{y_max:.1f}] mm")
+            return True
+        return False
+    
+    def calibrate_camera(self, tracker):
+        """Calibrate camera-to-workspace mapping after sensorless homing.
         
-        This method:
-        1. Uses camera to navigate paddle to bottom-left corner
-        2. Performs sensorless homing on X-min edge
-        3. Navigates to top-left, homes Y-max
-        4. Navigates to bottom-right, homes X-max
-        5. Navigates to top-right, homes Y-min (optional)
-        6. Returns to origin
+        After sensorless homing establishes the physical workspace (GROUND TRUTH),
+        this function moves the paddle to corners and records camera positions
+        to create an accurate camera-to-workspace transform.
         
         Args:
             tracker: PuckTracker instance with camera initialized
@@ -1072,86 +1211,94 @@ class MotorController:
         Returns:
             bool: True if successful
         """
+        if not self.homed:
+            print("✗ Error: Must run sensorless homing first!")
+            return False
+        
         print("\n" + "="*60)
-        print("CAMERA-GUIDED HOMING")
+        print("CAMERA CALIBRATION")
         print("="*60)
-        print("Using vision to navigate safely to edges...")
+        print("Recording paddle positions at workspace corners...")
+        print(f"Workspace from homing: X[0-{self.workspace_limits['x_max']:.1f}] Y[0-{self.workspace_limits['y_max']:.1f}] mm")
         print("="*60 + "\n")
         
-        if not self.enabled:
-            print("Enabling motors...")
-            if not self.enable():
-                return False
+        # Get workspace limits from homing (GROUND TRUTH)
+        ws_x_max = self.workspace_limits['x_max']
+        ws_y_max = self.workspace_limits['y_max']
+        margin = 15.0  # Stay 15mm from edges during calibration
         
-        if tracker.virtual_boundary is None:
-            print("✗ Error: Virtual boundary not detected. Cannot perform camera-guided homing.")
-            return False
+        calibration_points = []
         
-        # Get virtual boundary in camera pixels
-        x_min_cam, y_min_cam, x_max_cam, y_max_cam = tracker.virtual_boundary
-        
-        # Helper function to navigate to camera position
-        def navigate_to_camera_pos(target_cam_x, target_cam_y, description, approach_margin=20):
-            """Navigate paddle to target camera position."""
-            print(f"  Navigating to {description}...")
-            
-            timeout = time.time() + 15  # 15 second timeout
-            while time.time() < timeout:
-                paddle_pos = tracker.get_paddle_position()
-                if paddle_pos is None:
-                    print("    ⚠ Paddle not visible, waiting...")
-                    time.sleep(0.2)
-                    continue
-                
-                cam_x, cam_y = paddle_pos
-                
-                # Calculate error
-                error_x = target_cam_x - cam_x
-                error_y = target_cam_y - cam_y
-                
-                # Stop if close enough
-                if abs(error_x) < 5 and abs(error_y) < 5:
-                    self.stop()
-                    print(f"    ✓ Reached {description}")
-                    return True
-                
-                # Convert to workspace velocity (simple proportional control)
-                # Camera: 315x188 pixels -> Workspace: 70x35 mm
-                vel_x = (error_x / 315.0) * 200.0  # Scale to reasonable velocity
-                vel_y = (error_y / 188.0) * 100.0
-                
-                # Limit velocity
-                vel_x = max(-100, min(100, vel_x))
-                vel_y = max(-100, min(100, vel_y))
-                
-                self.set_velocity(vel_x, vel_y)
-                time.sleep(0.05)
-            
-            self.stop()
-            print(f"    ⚠ Timeout reaching {description}")
-            return False
-        
-        # Step 1: Navigate to bottom-left corner (X-min, Y-min)
-        target_x = x_min_cam + 20
-        target_y = y_min_cam + 20
-        if not navigate_to_camera_pos(target_x, target_y, "bottom-left corner"):
-            return False
-        
-        # Get current paddle position and localize
+        # Corner 1: Origin (0+margin, 0+margin)
+        print("Moving to corner 1 (origin area)...")
+        self.move_to(margin, margin)
+        time.sleep(2.0)  # Wait for motion to complete
         paddle_pos = tracker.get_paddle_position()
         if paddle_pos:
-            workspace_x, workspace_y = tracker.camera_to_workspace(*paddle_pos)
-            print(f"  Setting initial position: ({workspace_x:.1f}, {workspace_y:.1f}) mm")
-            # Assume this is near origin
-            self.workspace_limits = {'x_min': 0, 'y_min': 0, 'x_max': 70, 'y_max': 35}
-            self.localize_from_vision(5, 5)  # Assume near origin
+            calibration_points.append(('origin', (margin, margin), paddle_pos))
+            print(f"  Motor: ({margin:.1f}, {margin:.1f}) mm -> Camera: ({paddle_pos[0]:.0f}, {paddle_pos[1]:.0f}) px")
+        else:
+            print("  ⚠ Paddle not visible!")
         
-        print("\n✓ Camera-guided homing complete!")
-        print(f"  Workspace: X [{self.workspace_limits['x_min']:.1f} to {self.workspace_limits['x_max']:.1f}] mm")
-        print(f"             Y [{self.workspace_limits['y_min']:.1f} to {self.workspace_limits['y_max']:.1f}] mm")
+        # Corner 2: X-max (x_max-margin, margin)
+        print("Moving to corner 2 (X-max area)...")
+        self.move_to(ws_x_max - margin, margin)
+        time.sleep(2.0)
+        paddle_pos = tracker.get_paddle_position()
+        if paddle_pos:
+            calibration_points.append(('x_max', (ws_x_max - margin, margin), paddle_pos))
+            print(f"  Motor: ({ws_x_max - margin:.1f}, {margin:.1f}) mm -> Camera: ({paddle_pos[0]:.0f}, {paddle_pos[1]:.0f}) px")
+        else:
+            print("  ⚠ Paddle not visible!")
         
-        self.homed = True
-        return True
+        # Corner 3: Y-max (margin, y_max-margin)
+        print("Moving to corner 3 (Y-max area)...")
+        self.move_to(margin, ws_y_max - margin)
+        time.sleep(2.0)
+        paddle_pos = tracker.get_paddle_position()
+        if paddle_pos:
+            calibration_points.append(('y_max', (margin, ws_y_max - margin), paddle_pos))
+            print(f"  Motor: ({margin:.1f}, {ws_y_max - margin:.1f}) mm -> Camera: ({paddle_pos[0]:.0f}, {paddle_pos[1]:.0f}) px")
+        else:
+            print("  ⚠ Paddle not visible!")
+        
+        # Move back to center
+        print("Moving to center...")
+        self.move_to(ws_x_max / 2, ws_y_max / 2)
+        
+        # Calculate camera-to-workspace transform from calibration points
+        if len(calibration_points) >= 2:
+            # Use first two points to calculate scale and direction
+            p1_name, p1_motor, p1_cam = calibration_points[0]
+            p2_name, p2_motor, p2_cam = calibration_points[1]
+            
+            # Calculate pixel-to-mm ratios
+            motor_dx = p2_motor[0] - p1_motor[0]
+            motor_dy = p2_motor[1] - p1_motor[1]
+            cam_dx = p2_cam[0] - p1_cam[0]
+            cam_dy = p2_cam[1] - p1_cam[1]
+            
+            # Store calibration in tracker
+            if cam_dx != 0:
+                tracker.cam_to_ws_x_scale = motor_dx / cam_dx
+            if cam_dy != 0:
+                tracker.cam_to_ws_y_scale = motor_dy / cam_dy
+            
+            # Store reference point
+            tracker.cam_ref_point = p1_cam
+            tracker.ws_ref_point = p1_motor
+            
+            print("\n✓ Camera calibration complete!")
+            print(f"  X scale: {getattr(tracker, 'cam_to_ws_x_scale', 0):.4f} mm/pixel")
+            print(f"  Y scale: {getattr(tracker, 'cam_to_ws_y_scale', 0):.4f} mm/pixel")
+            
+            # Update tracker's workspace limits
+            tracker.set_workspace_limits(0, ws_x_max, 0, ws_y_max)
+            
+            return True
+        else:
+            print("✗ Calibration failed: Not enough visible points")
+            return False
     
     def move_to(self, x, y):
         """Move to absolute position (mm).
@@ -1206,25 +1353,25 @@ class MotorController:
         return self.current_x, self.current_y
     
     # Directional commands for testing
-    def right(self, speed=100.0):
+    def right(self, speed=200.0):
         """Move right at speed (mm/s)."""
-        print(f"→ RIGHT at {speed} mm/s")
+        print(f"RIGHT at {speed} mm/s")
         return self.set_velocity(speed, 0)
     
-    def left(self, speed=100.0):
+    def left(self, speed=200.0):
         """Move left at speed (mm/s)."""
-        print(f"← LEFT at {speed} mm/s")
+        print(f"LEFT at {speed} mm/s")
         return self.set_velocity(-speed, 0)
     
-    def up(self, speed=100.0):
-        """Move up at speed (mm/s)."""
-        print(f"↑ UP at {speed} mm/s")
-        return self.set_velocity(0, speed)
+    def up(self, speed=200.0):
+        """Move up in CAMERA view (motor Y decreases)."""
+        print(f"UP at {speed} mm/s")
+        return self.set_velocity(0, -speed)  # Camera Y is inverted from motor Y
     
-    def down(self, speed=100.0):
-        """Move down at speed (mm/s)."""
-        print(f"↓ DOWN at {speed} mm/s")
-        return self.set_velocity(0, -speed)
+    def down(self, speed=200.0):
+        """Move down in CAMERA view (motor Y increases)."""
+        print(f"DOWN at {speed} mm/s")
+        return self.set_velocity(0, speed)  # Camera Y is inverted from motor Y
     
     def emergency_stop(self):
         """Emergency stop - disables motors immediately."""
@@ -1276,13 +1423,15 @@ class DefenseController:
         self.running = False
         
         # Defense strategy parameters
-        self.defense_line_x = 10.0  # Default defense line (mm from goal)
-        self.max_speed = 180.0      # Max velocity command (mm/s) - Arduino clamps to 200
+        self.max_speed = 350.0      # Max velocity command (mm/s)
+        self.edge_margin = 10.0     # Stay this many mm away from workspace edges (matches Arduino)
         
-        # Control gains for position tracking
-        self.kp = 12.0  # Proportional gain - higher = faster response
-        self.kd = 3.0   # Derivative gain - damping to prevent overshoot
-        self.last_error_y = 0.0
+        # Control gains for position tracking (PD controller)
+        self.kp = 20.0  # Proportional gain - higher = faster response
+        self.kd = 3.0   # Derivative gain - damping to reduce oscillation
+        
+        # Suppress frequent status prints (keeps terminal clean for commands)
+        self.verbose = False
         
         # State tracking
         self.last_puck_pos = None
@@ -1290,24 +1439,18 @@ class DefenseController:
         self.last_paddle_pos = None
     
     def start_auto_defense(self):
-        """Start autonomous defense mode."""
-        if not self.motor.homed:
-            print("Warning: Motors not homed. Defense may be inaccurate.")
+        """Start autonomous defense mode using camera pixel tracking."""
+        if not self.tracker.virtual_boundary:
+            print("⚠ Error: No camera boundary set!")
+            print("  Use 'setcorner' at each corner of paddle's travel first.")
+            return False
         
-        # Set defense line based on workspace
-        y_range = self.motor.workspace_limits['y_max'] - self.motor.workspace_limits['y_min']
-        self.defense_line_x = self.motor.workspace_limits['x_min'] + 10.0  # 10mm from left edge
-        
-        print("\n" + "="*60)
-        print("AUTONOMOUS DEFENSE MODE")
-        print("="*60)
-        print(f"Defense line: X = {self.defense_line_x:.1f} mm")
-        print(f"Y range: {self.motor.workspace_limits['y_min']:.1f} to {self.motor.workspace_limits['y_max']:.1f} mm")
-        print(f"Max speed: {self.max_speed} mm/s")
-        print("\nArduino handles: kinematics, stall guard, boundary safety")
-        print("Python handles: vision, prediction, velocity commands")
-        print("\nType 'stop' to exit defense mode")
-        print("="*60 + "\n")
+        bx_min, by_min, bx_max, by_max = self.tracker.virtual_boundary
+        print(f"Auto defense ON - CAMERA PIXEL TRACKING mode")
+        print(f"  Camera boundary: ({bx_min}, {by_min}) to ({bx_max}, {by_max})")
+        print(f"  Size: {bx_max - bx_min} x {by_max - by_min} pixels")
+        print(f"  Max speed: {self.max_speed:.0f}mm/s")
+        print(f"  Using camera as feedback (no mm conversion)")
         
         self.auto_mode = True
         self.running = True
@@ -1317,112 +1460,257 @@ class DefenseController:
     
     def stop_auto_defense(self):
         """Stop autonomous defense mode."""
+        was_running = self.auto_mode
         self.auto_mode = False
         self.running = False
         if self.defense_thread:
             self.defense_thread.join(timeout=1)
         self.motor.stop()
-        print("Defense stopped")
+        if was_running:
+            print("Auto defense OFF")
     
-    def _calculate_intercept_y(self, puck_pos, puck_vel):
-        """Calculate Y position where puck will cross defense line.
+    def _calculate_intercept_position(self, puck_pos, puck_vel, paddle_pos):
+        """Calculate optimal intercept position for the paddle.
+        
+        Strategy: Move to intercept the puck along its trajectory.
+        The paddle can move freely on both axes within its workspace.
+        Uses homing-derived workspace limits as ground truth.
         
         Args:
             puck_pos: (x, y) in workspace mm
             puck_vel: (vx, vy) in mm/s
+            paddle_pos: (x, y) current paddle position in workspace mm
             
         Returns:
-            float: Y intercept position in mm, or None if puck moving away
+            (target_x, target_y): Position to move to, or None if no action needed
         """
         px, py = puck_pos
         vx, vy = puck_vel
         
-        # Only defend if puck is moving toward our goal (negative X velocity)
-        if vx >= -5.0:  # Small threshold to avoid jitter
-            return None
+        # Use homing-derived workspace limits (ground truth)
+        ws_x_min = self.motor.workspace_limits['x_min']
+        ws_x_max = self.motor.workspace_limits['x_max']
+        ws_y_min = self.motor.workspace_limits['y_min']
+        ws_y_max = self.motor.workspace_limits['y_max']
         
-        # Time for puck to reach defense line
-        dx = self.defense_line_x - px
-        if vx == 0:
-            return None
+        # Safety margins from edges
+        x_min = ws_x_min + self.edge_margin
+        x_max = ws_x_max - self.edge_margin
+        y_min = ws_y_min + self.edge_margin
+        y_max = ws_y_max - self.edge_margin
         
-        time_to_intercept = dx / vx  # This will be positive since dx<0 and vx<0
+        puck_speed = np.sqrt(vx**2 + vy**2)
         
-        if time_to_intercept < 0 or time_to_intercept > 2.0:  # Ignore if >2 seconds away
-            return None
+        # If puck is slow or stationary, move directly toward it
+        if puck_speed < 20.0:
+            target_x = max(x_min, min(x_max, px))
+            target_y = max(y_min, min(y_max, py))
+            return (target_x, target_y)
         
-        # Predict Y position at intercept (simple linear, no bounces for now)
-        intercept_y = py + vy * time_to_intercept
+        # If puck is moving toward our goal (negative X = toward left/goal)
+        if vx < -10.0:
+            # Calculate time for puck to reach our defensive zone (left third)
+            intercept_x = max(x_min, ws_x_max * 0.3)  # Intercept in left 30%
+            
+            if px > intercept_x:
+                time_to_intercept = (intercept_x - px) / vx
+                if 0 < time_to_intercept < 1.5:
+                    # Predict where puck will be at intercept time
+                    target_y = py + vy * time_to_intercept
+                    target_y = max(y_min, min(y_max, target_y))
+                    return (intercept_x, target_y)
         
-        # Clamp to workspace bounds
-        intercept_y = max(self.motor.workspace_limits['y_min'], 
-                         min(self.motor.workspace_limits['y_max'], intercept_y))
+        # Puck moving away or across - chase it directly
+        # Project puck position forward a bit (0.2 seconds)
+        prediction_time = 0.2
+        future_x = px + vx * prediction_time
+        future_y = py + vy * prediction_time
         
-        return intercept_y
+        # Clamp to workspace
+        target_x = max(x_min, min(x_max, future_x))
+        target_y = max(y_min, min(y_max, future_y))
+        
+        return (target_x, target_y)
     
     def _defense_loop(self):
-        """Main defense control loop.
+        """Main defense control loop using CAMERA PIXELS directly.
         
         Strategy:
-        1. Get puck position/velocity from camera (workspace coords)
-        2. Calculate where puck will cross defense line
-        3. Calculate velocity to move paddle there
-        4. Send velocity command to Arduino (it handles safety)
+        1. Get puck and paddle positions in CAMERA PIXELS
+        2. Calculate error in pixels
+        3. Send velocity proportional to pixel error
+        4. Camera provides closed-loop feedback
+        
+        No mm conversion needed - camera is the ground truth!
         """
         puck_was_in_play = True
+        last_error_x = 0.0
+        last_error_y = 0.0
+        
+        # Get camera boundary (from setcorner)
+        if not self.tracker.virtual_boundary:
+            print("⚠ Error: No camera boundary set! Use 'setcorner' first.")
+            self.auto_mode = False
+            return
+        
+        bx_min, by_min, bx_max, by_max = self.tracker.virtual_boundary
+        center_px = (bx_min + bx_max) / 2.0
+        center_py = (by_min + by_max) / 2.0
+        
+        # Pixel-to-velocity gain (tune this for responsiveness)
+        # Higher = faster response, lower = smoother
+        PIXEL_GAIN = 1.0  # mm/s per pixel of error
         
         while self.running and self.auto_mode:
             try:
-                # === GATHER CONTEXT FROM CAMERA ===
+                # === GET POSITIONS IN CAMERA PIXELS ===
+                puck_pos = self.tracker.get_puck_state()[0]  # (x, y) in pixels
+                paddle_pos = self.tracker.get_paddle_position()  # (x, y) in pixels
+                
+                if paddle_pos is None:
+                    # Can't see paddle - stop
+                    self.motor.stop()
+                    time.sleep(0.05)
+                    continue
+                
+                paddle_x, paddle_y = paddle_pos
+                
+                # === DETERMINE TARGET IN PIXELS ===
+                if puck_pos is None:
+                    # No puck - return to center of boundary
+                    target_x = center_px
+                    target_y = center_py
+                else:
+                    # Chase the puck!
+                    puck_x, puck_y = puck_pos
+                    
+                    # Clamp puck position to boundary
+                    target_x = max(bx_min + 20, min(bx_max - 20, puck_x))
+                    target_y = max(by_min + 20, min(by_max - 20, puck_y))
+                
+                # === CALCULATE ERROR IN PIXELS ===
+                error_x = target_x - paddle_x
+                error_y = target_y - paddle_y
+                
+                # PD control
+                d_error_x = error_x - last_error_x
+                d_error_y = error_y - last_error_y
+                last_error_x = error_x
+                last_error_y = error_y
+                
+                # Calculate velocity command
+                # IMPORTANT: Camera Y is inverted from motor Y
+                # Camera: Y increases downward
+                # Motor: Y increases upward (typically)
+                # So we NEGATE vy
+                vx = (error_x * PIXEL_GAIN * self.kp) + (d_error_x * self.kd)
+                vy = -((error_y * PIXEL_GAIN * self.kp) + (d_error_y * self.kd))  # INVERTED
+                
+                # Clamp velocity
+                speed = np.sqrt(vx**2 + vy**2)
+                if speed > self.max_speed:
+                    scale = self.max_speed / speed
+                    vx *= scale
+                    vy *= scale
+                
+                # Send velocity command
+                self.motor.set_velocity(vx, vy)
+                
+            except Exception as e:
+                print(f"Defense error: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            time.sleep(0.025)  # 40 Hz control loop
+    
+    def _defense_loop_old(self):
+        """Old defense loop using mm conversion (kept for reference)."""
+        puck_was_in_play = True
+        last_error_x = 0.0
+        last_error_y = 0.0
+        
+        ws_x_min = self.motor.workspace_limits['x_min']
+        ws_x_max = self.motor.workspace_limits['x_max']
+        ws_y_min = self.motor.workspace_limits['y_min']
+        ws_y_max = self.motor.workspace_limits['y_max']
+        
+        while self.running and self.auto_mode:
+            try:
                 puck_in_play = self.tracker.is_puck_in_play()
                 
                 if not puck_in_play:
                     if puck_was_in_play:
-                        print("Puck out of play - waiting...")
-                        self.motor.stop()
+                        if self.verbose:
+                            print("Puck out of play - returning to center...")
                         puck_was_in_play = False
+                    
+                    center_x = (ws_x_max + ws_x_min) / 2.0
+                    center_y = (ws_y_max + ws_y_min) / 2.0
+                    
+                    paddle_pos = self.tracker.get_paddle_workspace_pos()
+                    if paddle_pos:
+                        current_x, current_y = paddle_pos
+                    else:
+                        current_x, current_y = center_x, center_y
+                    
+                    error_x = center_x - current_x
+                    error_y = center_y - current_y
+                    
+                    vx = error_x * 5.0
+                    vy = error_y * 5.0
+                    
+                    speed = np.sqrt(vx**2 + vy**2)
+                    if speed > 100:
+                        scale = 100 / speed
+                        vx *= scale
+                        vy *= scale
+                    
+                    self.motor.set_velocity(vx, vy)
                     time.sleep(0.05)
                     continue
                 else:
                     if not puck_was_in_play:
-                        print("Puck in play - defending!")
+                        if self.verbose:
+                            print("Puck in play - defending!")
                         puck_was_in_play = True
                 
-                # Get puck state in workspace coordinates
+                # Get puck state in workspace coordinates (uses homing limits)
                 puck_pos, puck_vel = self.tracker.get_puck_workspace_state()
                 
                 if puck_pos is None:
-                    # No puck detected, hold position
-                    self.motor.stop()
                     time.sleep(0.02)
                     continue
                 
                 self.last_puck_pos = puck_pos
                 self.last_puck_vel = puck_vel
                 
-                # Get paddle position from camera (for feedback if needed)
+                # Get paddle position from camera (in homing workspace coords)
                 paddle_pos = self.tracker.get_paddle_workspace_pos()
                 if paddle_pos:
                     self.last_paddle_pos = paddle_pos
+                    current_x, current_y = paddle_pos
+                else:
+                    # No paddle detected - skip this frame
+                    time.sleep(0.02)
+                    continue
                 
-                # === CALCULATE OPTIMAL DEFENSE POSITION ===
-                target_y = self._calculate_intercept_y(puck_pos, puck_vel)
+                # === CALCULATE OPTIMAL INTERCEPT POSITION ===
+                target = self._calculate_intercept_position(puck_pos, puck_vel, paddle_pos)
                 
-                if target_y is not None:
-                    # Puck approaching - intercept it!
-                    # Use motor's current position for control (from Arduino feedback)
-                    current_y = self.motor.current_y
+                if target is not None:
+                    target_x, target_y = target
                     
-                    # PD control for Y axis
+                    # PD control for both axes
+                    error_x = target_x - current_x
                     error_y = target_y - current_y
-                    d_error_y = error_y - self.last_error_y
-                    self.last_error_y = error_y
                     
+                    d_error_x = error_x - last_error_x
+                    d_error_y = error_y - last_error_y
+                    last_error_x = error_x
+                    last_error_y = error_y
+                    
+                    vx = (self.kp * error_x) + (self.kd * d_error_x)
                     vy = (self.kp * error_y) + (self.kd * d_error_y)
-                    
-                    # Move toward defense line on X axis
-                    error_x = self.defense_line_x - self.motor.current_x
-                    vx = self.kp * error_x * 0.5  # Slower X correction
                     
                     # Clamp velocity magnitude
                     speed = np.sqrt(vx**2 + vy**2)
@@ -1431,24 +1719,20 @@ class DefenseController:
                         vx *= scale
                         vy *= scale
                     
+                    # Edge safety using homing limits
+                    edge_dist = 10.0  # Safety distance from edge (mm)
+                    
+                    # Don't accelerate toward edges we're close to
+                    if current_x < (ws_x_min + edge_dist) and vx < 0:
+                        vx = 0
+                    if current_x > (ws_x_max - edge_dist) and vx > 0:
+                        vx = 0
+                    if current_y < (ws_y_min + edge_dist) and vy < 0:
+                        vy = 0
+                    if current_y > (ws_y_max - edge_dist) and vy > 0:
+                        vy = 0
+                    
                     # === SEND VELOCITY COMMAND TO ARDUINO ===
-                    # Arduino handles: CoreXY kinematics, stall guard, boundary clamping
-                    self.motor.set_velocity(vx, vy)
-                    
-                else:
-                    # Puck moving away or stationary - return to center
-                    center_y = (self.motor.workspace_limits['y_max'] + 
-                               self.motor.workspace_limits['y_min']) / 2.0
-                    
-                    error_y = center_y - self.motor.current_y
-                    vy = error_y * 3.0  # Gentle return to center
-                    vy = max(-50, min(50, vy))  # Limit centering speed
-                    
-                    # Also center on X (defense line)
-                    error_x = self.defense_line_x - self.motor.current_x
-                    vx = error_x * 2.0
-                    vx = max(-30, min(30, vx))
-                    
                     self.motor.set_velocity(vx, vy)
                 
             except Exception as e:
@@ -1542,18 +1826,20 @@ def main():
         print("="*60)
         print("\nCommands:")
         print("  auto         - Start autonomous defense")
-        print("  stop         - Stop autonomous defense")
+        print("  stop         - Stop all motion")
+        print("  debug        - Toggle Arduino motion debug output")
         print("  view         - Toggle web stream (http://<ip>:5001)")
-        print("  right        - Move right")
-        print("  left         - Move left")
-        print("  up           - Move up")
-        print("  down         - Move down")
-        print("  center       - Move to center")
+        print("  right/left/up/down - Manual movement (200mm/s)")
+        print("  center       - MOVE to center of workspace")
+        print("  reset        - SET position to center (no motion)")
         print("  home         - Run sensorless homing")
-        print("  camera_home  - Camera-guided safe homing")
-        print("  localize     - Use camera to find current position (no motors)")
+        print("  setcorner    - Record paddle position as boundary corner")
+        print("  clearcorners - Clear recorded corners")
+        print("  syncws       - Sync motor workspace to physical travel")
+        print("  status       - Show current position and limits")
         print("  quit         - Exit")
-        print("\nPress Ctrl+C at any time to emergency stop")
+        print("\nSetup: home -> view -> setcorner (x4) -> syncws -> auto")
+        print("Press Ctrl+C at any time to emergency stop")
         print("="*60 + "\n")
         
         # Main command loop
@@ -1626,6 +1912,68 @@ def main():
                     print(f"Moving to center ({center_x:.1f}, {center_y:.1f})...")
                     motor.move_to(center_x, center_y)
                 
+                elif cmd == 'reset':
+                    # Reset position to center WITHOUT moving (for when position tracking is wrong)
+                    center_x = (motor.workspace_limits['x_max'] + motor.workspace_limits['x_min']) / 2.0
+                    center_y = (motor.workspace_limits['y_max'] + motor.workspace_limits['y_min']) / 2.0
+                    motor.current_x = center_x
+                    motor.current_y = center_y
+                    # Also tell Arduino
+                    motor.send_cmd({"cmd": "localize", "x": center_x, "y": center_y})
+                    print(f"Position RESET to center ({center_x:.1f}, {center_y:.1f}) - no motion")
+                
+                elif cmd == 'setcorner':
+                    # Record paddle position as a corner of the virtual boundary
+                    if not camera_available:
+                        print("⚠ Error: Camera not available")
+                    else:
+                        paddle_pos = tracker.get_paddle_position()
+                        if paddle_pos is None:
+                            print("⚠ Error: Paddle not visible!")
+                        else:
+                            if not hasattr(tracker, '_corners'):
+                                tracker._corners = []
+                            # Store as integers
+                            corner = (int(paddle_pos[0]), int(paddle_pos[1]))
+                            tracker._corners.append(corner)
+                            print(f"Corner {len(tracker._corners)} recorded: pixel ({corner[0]}, {corner[1]})")
+                            if len(tracker._corners) >= 2:
+                                # Calculate bounding box from all corners
+                                xs = [c[0] for c in tracker._corners]
+                                ys = [c[1] for c in tracker._corners]
+                                new_boundary = (int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys)))
+                                tracker.virtual_boundary = new_boundary
+                                tracker.MANUAL_BOUNDARY = new_boundary
+                                print(f"✓ Virtual boundary updated: ({new_boundary[0]}, {new_boundary[1]}) to ({new_boundary[2]}, {new_boundary[3]})")
+                                print(f"  Size: {new_boundary[2]-new_boundary[0]} x {new_boundary[3]-new_boundary[1]} pixels")
+                
+                elif cmd == 'clearcorners':
+                    if hasattr(tracker, '_corners'):
+                        tracker._corners = []
+                    print("Corners cleared - use 'setcorner' to record new ones")
+                
+                elif cmd == 'syncws':
+                    # After setting corners, sync motor workspace to match
+                    # This tells the motor its ACTUAL physical travel limits
+                    print("\nSYNC WORKSPACE")
+                    print("This sets motor workspace to match paddle's actual travel.")
+                    print("Enter the physical dimensions (in mm) of your paddle's travel:")
+                    try:
+                        x_travel = float(input("  X travel (mm, e.g. 50): ").strip() or "50")
+                        y_travel = float(input("  Y travel (mm, e.g. 30): ").strip() or "30")
+                        
+                        # Update motor workspace
+                        motor.set_workspace(0, x_travel, 0, y_travel)
+                        
+                        # Update tracker workspace
+                        tracker.set_workspace_limits(0, x_travel, 0, y_travel)
+                        
+                        print(f"\n✓ Workspace synced: X[0-{x_travel}mm] Y[0-{y_travel}mm]")
+                        print("  Camera boundary will now map to this workspace.")
+                        print("  Auto defense should now work correctly!")
+                    except ValueError:
+                        print("Invalid input - use numbers only")
+                
                 elif cmd == 'home':
                     if motor.home():
                         # Update tracker with new workspace limits
@@ -1642,6 +1990,31 @@ def main():
                         print("⚠ Error: Camera not available. Cannot perform camera-guided homing.")
                     else:
                         motor.camera_guided_home(tracker)
+                
+                elif cmd == 'debug':
+                    # Toggle debug streaming
+                    if not hasattr(motor, '_debug_enabled'):
+                        motor._debug_enabled = False
+                    motor._debug_enabled = not motor._debug_enabled
+                    motor.set_debug_stream(motor._debug_enabled)
+                
+                elif cmd == 'verbose':
+                    defense.verbose = not defense.verbose
+                    print(f"Verbose mode: {'ON' if defense.verbose else 'OFF'}")
+                
+                elif cmd == 'calibrate':
+                    # Run camera calibration after homing
+                    if not camera_available:
+                        print("⚠ Error: Camera not available")
+                    elif not motor.homed:
+                        print("⚠ Error: Run 'home' first to establish workspace limits")
+                    else:
+                        motor.calibrate_camera(tracker)
+                
+                elif cmd == 'status':
+                    print(f"Position: ({motor.current_x:.1f}, {motor.current_y:.1f}) mm")
+                    print(f"Workspace: X[{motor.workspace_limits['x_min']:.1f}-{motor.workspace_limits['x_max']:.1f}] Y[{motor.workspace_limits['y_min']:.1f}-{motor.workspace_limits['y_max']:.1f}] mm")
+                    print(f"Homed: {motor.homed}, Enabled: {motor.enabled}")
                 
                 else:
                     print(f"Unknown command: {cmd}")

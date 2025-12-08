@@ -41,6 +41,13 @@ const uint8_t  STALL_STOP_STEPS   = 15;
 
 // Motion parameters
 const float STEPS_PER_MM = 160.0f;   // Adjust for your setup
+const float MAX_VELOCITY = 400.0f;   // mm/s max speed
+const float MAX_ACCEL = 6000.0f;     // mm/s^2 max acceleration
+
+// PID gains for position control
+const float KP_POS = 15.0f;          // Proportional gain (higher = faster response)
+const float KD_POS = 0.5f;           // Derivative gain (damping)
+const float MIN_VELOCITY = 5.0f;     // Minimum movement speed (mm/s)
 
 // CoreXY motor directions
 const uint8_t A_DIR_POS = HIGH;
@@ -66,10 +73,24 @@ float y_min = 0.0f;
 float y_max = 35.0f;  // Default, will be measured
 
 // Velocity control
-float target_x_vel = 0.0f;  // mm/s
+float target_x_vel = 0.0f;  // mm/s - commanded velocity
 float target_y_vel = 0.0f;  // mm/s
+float current_x_vel = 0.0f; // mm/s - actual velocity (ramped)
+float current_y_vel = 0.0f; // mm/s
 unsigned long last_move_time = 0;
-const uint16_t VELOCITY_UPDATE_MS = 20;  // Update position every 20ms
+const uint16_t VELOCITY_UPDATE_MS = 10;  // Update position every 10ms (100Hz)
+
+// Position target mode (for PID control)
+bool position_mode = false;
+float target_x_pos = 0.0f;  // Target position in mm
+float target_y_pos = 0.0f;
+float last_error_x = 0.0f;  // For derivative term
+float last_error_y = 0.0f;
+
+// Debug streaming
+bool stream_debug = false;
+unsigned long last_stream_time = 0;
+const uint16_t STREAM_INTERVAL_MS = 80;  // Stream every 80ms when enabled
 
 // ================= TMC CONFIGURATION ====================
 
@@ -449,20 +470,50 @@ void handleVelocityCommand(JsonDocument& doc) {
     return;
   }
   
+  // Disable position mode when receiving velocity commands
+  position_mode = false;
+  
   target_x_vel = doc["x_vel"] | 0.0f;
   target_y_vel = doc["y_vel"] | 0.0f;
   
-  // Constrain velocity to reasonable limits
-  target_x_vel = constrain(target_x_vel, -200.0f, 200.0f);
-  target_y_vel = constrain(target_y_vel, -200.0f, 200.0f);
+  // Constrain velocity to max limits
+  target_x_vel = constrain(target_x_vel, -MAX_VELOCITY, MAX_VELOCITY);
+  target_y_vel = constrain(target_y_vel, -MAX_VELOCITY, MAX_VELOCITY);
   
   sendResponse("velocity", "ok");
 }
 
 void handleStopCommand() {
+  position_mode = false;
   target_x_vel = 0.0f;
   target_y_vel = 0.0f;
+  current_x_vel = 0.0f;
+  current_y_vel = 0.0f;
   sendResponse("stop", "ok");
+}
+
+void handlePositionCommand(JsonDocument& doc) {
+  if (!motors_enabled) {
+    sendResponse("position", "error", "Motors not enabled");
+    return;
+  }
+  
+  // Set target position for PID control
+  target_x_pos = doc["x"] | cur_x_mm;
+  target_y_pos = doc["y"] | cur_y_mm;
+  
+  // Clamp to workspace
+  if (homed) {
+    target_x_pos = constrain(target_x_pos, x_min, x_max);
+    target_y_pos = constrain(target_y_pos, y_min, y_max);
+  }
+  
+  // Enable position mode
+  position_mode = true;
+  last_error_x = 0.0f;
+  last_error_y = 0.0f;
+  
+  sendResponse("position", "ok");
 }
 
 void handleLocalizeCommand(JsonDocument &doc) {
@@ -493,6 +544,35 @@ void handleLocalizeCommand(JsonDocument &doc) {
   sendResponse("localize", "ok");
 }
 
+void handleSetWorkspaceCommand(JsonDocument &doc) {
+  // Manually set workspace limits (use when homing gives wrong values)
+  float new_x_max = doc["x_max"] | x_max;
+  float new_y_max = doc["y_max"] | y_max;
+  float new_x_min = doc["x_min"] | x_min;
+  float new_y_min = doc["y_min"] | y_min;
+  
+  x_min = new_x_min;
+  x_max = new_x_max;
+  y_min = new_y_min;
+  y_max = new_y_max;
+  
+  // CRITICAL: Reset current position to center of new workspace
+  // This prevents the robot from thinking it's outside boundaries
+  cur_x_mm = (new_x_min + new_x_max) / 2.0f;
+  cur_y_mm = (new_y_min + new_y_max) / 2.0f;
+  
+  // Stop all motion
+  target_x_vel = 0.0f;
+  target_y_vel = 0.0f;
+  current_x_vel = 0.0f;
+  current_y_vel = 0.0f;
+  
+  // Mark as homed since we now have valid limits
+  homed = true;
+  
+  sendResponse("set_workspace", "ok");
+}
+
 void handleStatusCommand() {
   JsonDocument doc;
   doc["cmd"] = "status";
@@ -505,8 +585,52 @@ void handleStatusCommand() {
   doc["y_max"] = y_max;
   doc["homed"] = homed;
   doc["enabled"] = motors_enabled;
-  doc["x_vel"] = target_x_vel;
-  doc["y_vel"] = target_y_vel;
+  doc["x_vel"] = current_x_vel;
+  doc["y_vel"] = current_y_vel;
+  doc["pos_mode"] = position_mode;
+  doc["streaming"] = stream_debug;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void handleStreamCommand(JsonDocument& doc) {
+  stream_debug = doc["state"] | false;
+  sendResponse("stream", "ok", stream_debug ? "Debug streaming ON" : "Debug streaming OFF");
+}
+
+void streamMotionDebug() {
+  // Only stream if enabled and enough time has passed
+  if (!stream_debug) return;
+  
+  unsigned long now = millis();
+  if (now - last_stream_time < STREAM_INTERVAL_MS) return;
+  last_stream_time = now;
+  
+  // Only stream if there's actual motion (not when stopped)
+  float speed = sqrtf(current_x_vel * current_x_vel + current_y_vel * current_y_vel);
+  if (speed < 3.0f && !position_mode) return;  // Don't spam when stopped
+  
+  JsonDocument doc;
+  doc["debug"] = "motion";
+  doc["x"] = cur_x_mm;
+  doc["y"] = cur_y_mm;
+  doc["vx"] = current_x_vel;
+  doc["vy"] = current_y_vel;
+  
+  // Direction indicators
+  String dir = "";
+  if (current_y_vel > 5.0f) dir += "UP ";
+  if (current_y_vel < -5.0f) dir += "DOWN ";
+  if (current_x_vel > 5.0f) dir += "RIGHT ";
+  if (current_x_vel < -5.0f) dir += "LEFT ";
+  if (dir == "") dir = "IDLE";
+  doc["dir"] = dir;
+  doc["speed"] = speed;
+  
+  // Include workspace limits for debugging
+  doc["x_max"] = x_max;
+  doc["y_max"] = y_max;
+  
   serializeJson(doc, Serial);
   Serial.println();
 }
@@ -545,6 +669,12 @@ void processSerialCommands() {
             handleLocalizeCommand(doc);
           } else if (strcmp(cmd, "status") == 0) {
             handleStatusCommand();
+          } else if (strcmp(cmd, "position") == 0) {
+            handlePositionCommand(doc);
+          } else if (strcmp(cmd, "stream") == 0) {
+            handleStreamCommand(doc);
+          } else if (strcmp(cmd, "set_workspace") == 0) {
+            handleSetWorkspaceCommand(doc);
           } else {
             sendResponse("error", "failed", "Unknown command");
           }
@@ -561,37 +691,94 @@ void processSerialCommands() {
   }
 }
 
-// Update position based on velocity
+// Ramp velocity with acceleration limit
+float rampVelocity(float current, float target, float dt) {
+  float max_delta = MAX_ACCEL * dt;  // Max velocity change this frame
+  float delta = target - current;
+  
+  if (delta > max_delta) {
+    return current + max_delta;
+  } else if (delta < -max_delta) {
+    return current - max_delta;
+  }
+  return target;
+}
+
+// Update position based on velocity with acceleration limiting
 void updateVelocityControl() {
   unsigned long now = millis();
   
   if (now - last_move_time >= VELOCITY_UPDATE_MS) {
     float dt = (now - last_move_time) / 1000.0f;  // seconds
     
-    if (target_x_vel != 0.0f || target_y_vel != 0.0f) {
-      float new_x = cur_x_mm + (target_x_vel * dt);
-      float new_y = cur_y_mm + (target_y_vel * dt);
+    // === POSITION MODE: PID control to target position ===
+    if (position_mode) {
+      // Calculate position error
+      float error_x = target_x_pos - cur_x_mm;
+      float error_y = target_y_pos - cur_y_mm;
       
-      // Boundary check - stop before hitting edges
-      if (homed) {
-        // Check if we're at or beyond boundaries
-        bool at_x_min = (new_x <= x_min);
-        bool at_x_max = (new_x >= x_max);
-        bool at_y_min = (new_y <= y_min);
-        bool at_y_max = (new_y >= y_max);
-        
-        // Clamp position to boundaries
-        new_x = constrain(new_x, x_min, x_max);
-        new_y = constrain(new_y, y_min, y_max);
-        
-        // Stop velocity if we hit boundary
-        if (at_x_min && target_x_vel < 0) target_x_vel = 0.0f;  // Stopped at min, moving neg
-        if (at_x_max && target_x_vel > 0) target_x_vel = 0.0f;  // Stopped at max, moving pos
-        if (at_y_min && target_y_vel < 0) target_y_vel = 0.0f;
-        if (at_y_max && target_y_vel > 0) target_y_vel = 0.0f;
+      // Derivative of error
+      float d_error_x = (error_x - last_error_x) / dt;
+      float d_error_y = (error_y - last_error_y) / dt;
+      last_error_x = error_x;
+      last_error_y = error_y;
+      
+      // PD control: velocity = Kp * error + Kd * d_error
+      // Farther away = faster, closer = slower
+      target_x_vel = (KP_POS * error_x) + (KD_POS * d_error_x);
+      target_y_vel = (KP_POS * error_y) + (KD_POS * d_error_y);
+      
+      // Clamp to max velocity
+      float speed = sqrtf(target_x_vel * target_x_vel + target_y_vel * target_y_vel);
+      if (speed > MAX_VELOCITY) {
+        float scale = MAX_VELOCITY / speed;
+        target_x_vel *= scale;
+        target_y_vel *= scale;
       }
       
-      move_to_xy_mm(new_x, new_y, 100);  // Fast update
+      // Stop if close enough to target
+      float dist = sqrtf(error_x * error_x + error_y * error_y);
+      if (dist < 0.5f) {  // Within 0.5mm
+        target_x_vel = 0.0f;
+        target_y_vel = 0.0f;
+        current_x_vel = 0.0f;
+        current_y_vel = 0.0f;
+      }
+    }
+    
+    // === VELOCITY RAMPING: Apply acceleration limits ===
+    current_x_vel = rampVelocity(current_x_vel, target_x_vel, dt);
+    current_y_vel = rampVelocity(current_y_vel, target_y_vel, dt);
+    
+    // === MOTION: Apply velocity to position ===
+    if (current_x_vel != 0.0f || current_y_vel != 0.0f) {
+      float new_x = cur_x_mm + (current_x_vel * dt);
+      float new_y = cur_y_mm + (current_y_vel * dt);
+      
+      // Use HOMING-derived limits as ground truth (with safety margin)
+      float margin = 10.0f;  // Pre-emptive stop margin in mm
+      
+      // Boundary check - stop BEFORE hitting edges
+      bool at_x_min = (new_x <= x_min + margin);
+      bool at_x_max = (new_x >= x_max - margin);
+      bool at_y_min = (new_y <= y_min + margin);
+      bool at_y_max = (new_y >= y_max - margin);
+      
+      // Hard clamp to homing limits
+      new_x = constrain(new_x, x_min, x_max);
+      new_y = constrain(new_y, y_min, y_max);
+      
+      // Stop velocity if within margin of boundary
+      if (at_x_min && current_x_vel < 0) { current_x_vel = 0.0f; target_x_vel = 0.0f; }
+      if (at_x_max && current_x_vel > 0) { current_x_vel = 0.0f; target_x_vel = 0.0f; }
+      if (at_y_min && current_y_vel < 0) { current_y_vel = 0.0f; target_y_vel = 0.0f; }
+      if (at_y_max && current_y_vel > 0) { current_y_vel = 0.0f; target_y_vel = 0.0f; }
+      
+      // Calculate step delay based on velocity (faster = shorter delay)
+      float speed = sqrtf(current_x_vel * current_x_vel + current_y_vel * current_y_vel);
+      uint16_t step_delay = (speed > 50.0f) ? 50 : 150;  // Faster stepping at high speed
+      
+      move_to_xy_mm(new_x, new_y, step_delay);
     }
     
     last_move_time = now;
@@ -652,5 +839,6 @@ void setup() {
 void loop() {
   processSerialCommands();
   updateVelocityControl();
+  streamMotionDebug();   // Stream debug info if enabled
   checkSerialTimeout();  // Stop motors if Python disconnects
 }

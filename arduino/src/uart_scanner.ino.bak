@@ -1,0 +1,279 @@
+/*
+ * TMC2209 UART Address & Bus Scanner
+ * 
+ * Scans all possible UART configurations and addresses to find TMC2209 drivers.
+ * Tests different bus combinations and all 4 possible addresses (0b00, 0b01, 0b10, 0b11)
+ * 
+ * Compatible with XIAO RP2350
+ */
+
+#include <Arduino.h>
+#include <TMCStepper.h>
+
+#define R_SENSE 0.11f
+
+// Pin definitions for XIAO RP2350
+#define TMC1_RX D3
+#define TMC1_TX D4
+#define TMC2_RX D9
+#define TMC2_TX D10
+
+// All possible TMC2209 addresses
+const uint8_t addresses[] = {0b00, 0b01, 0b10, 0b11};
+const char* addressNames[] = {"0b00", "0b01", "0b10", "0b11"};
+const int NUM_ADDRESSES = 4;
+
+// Test a single bus configuration and return number of drivers found
+int testBusConfig(SerialUART& serial, int rxPin, int txPin, const char* busName) {
+  int foundCount = 0;
+  
+  Serial.print("Testing ");
+  Serial.print(busName);
+  Serial.print(" (RX=");
+  Serial.print(rxPin);
+  Serial.print(", TX=");
+  Serial.print(txPin);
+  Serial.println("):");
+  Serial.println("-----------------------------------------------");
+  
+  // Configure pins and start serial
+  serial.setRX(rxPin);
+  serial.setTX(txPin);
+  serial.begin(115200);
+  delay(100);
+  
+  // Test each address on this bus
+  for (int addrIdx = 0; addrIdx < NUM_ADDRESSES; addrIdx++) {
+    uint8_t addr = addresses[addrIdx];
+    
+    Serial.print("  Address ");
+    Serial.print(addressNames[addrIdx]);
+    Serial.print(": ");
+    
+    // Create driver instance
+    TMC2209Stepper driver(&serial, R_SENSE, addr);
+    driver.begin();
+    delay(50);
+    
+    // Try to read VERSION register
+    uint8_t version = driver.version();
+    delay(10);
+    
+    // Verify by reading again
+    uint8_t version2 = driver.version();
+    delay(10);
+    
+    if (version != 0 && version != 0xFF && version == version2) {
+      // Valid response!
+      Serial.print("FOUND! Version: 0x");
+      Serial.print(version, HEX);
+      Serial.println();
+      foundCount++;
+      
+      // Check UART enable status via IOIN register
+      delay(50);
+      uint32_t ioin = driver.IOIN();
+      bool pdn_uart_state = (ioin >> 1) & 0x01;  // PDN_UART bit is bit 1 in IOIN
+      
+      Serial.print("    UART Enabled (PDN_UART pin): ");
+      if (pdn_uart_state) {
+        Serial.println("YES - Pin is HIGH");
+      } else {
+        Serial.println("NO - Pin is LOW (should be HIGH for UART mode!)");
+      }
+      
+      // Try to get more info
+      delay(50);
+      uint16_t current = driver.rms_current();
+      uint16_t microsteps = driver.microsteps();
+      
+      Serial.print("    Current: ");
+      Serial.print(current);
+      Serial.print("mA, Microsteps: ");
+      Serial.println(microsteps);
+      
+      // Check other IOIN status bits
+      bool enn_state = (ioin >> 0) & 0x01;
+      bool ms1_state = (ioin >> 2) & 0x01;
+      bool ms2_state = (ioin >> 3) & 0x01;
+      bool diag_state = (ioin >> 4) & 0x01;
+      bool step_state = (ioin >> 7) & 0x01;
+      
+      Serial.print("    IOIN Status: ENN=");
+      Serial.print(enn_state);
+      Serial.print(" MS1=");
+      Serial.print(ms1_state);
+      Serial.print(" MS2=");
+      Serial.print(ms2_state);
+      Serial.print(" DIAG=");
+      Serial.print(diag_state);
+      Serial.print(" STEP=");
+      Serial.println(step_state);
+      
+      // Test write capability
+      driver.rms_current(600);
+      delay(50);
+      uint16_t readback = driver.rms_current();
+      
+      if (readback > 500 && readback < 700) {
+        Serial.println("    Write test: PASSED");
+      } else {
+        Serial.print("    Write test: FAILED (wrote 600, read ");
+        Serial.print(readback);
+        Serial.println(")");
+      }
+      
+    } else if (version == 0 || version == 0xFF) {
+      Serial.println("No response");
+    } else {
+      Serial.print("? Inconsistent (0x");
+      Serial.print(version, HEX);
+      Serial.print(" / 0x");
+      Serial.print(version2, HEX);
+      Serial.println(")");
+    }
+    
+    delay(100);
+  }
+  
+  serial.end();
+  Serial.println();
+  delay(200);
+  
+  return foundCount;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);  // Wait for serial monitor
+  
+  Serial.println("\n\n========================================");
+  Serial.println("   TMC2209 UART BUS & ADDRESS SCANNER   ");
+  Serial.println("   (XIAO RP2350 Version)                ");
+  Serial.println("========================================\n");
+  
+  Serial.println("This tool will:");
+  Serial.println("  1. Test bus configurations (normal + swapped RX/TX)");
+  Serial.println("  2. Try all 4 possible addresses on each bus");
+  Serial.println("  3. Check if UART is enabled on each driver");
+  Serial.println("  4. Report which configurations respond\n");
+  
+  Serial.println("Pin Configuration:");
+  Serial.print("  Bus1: RX=D"); Serial.print(TMC1_RX);
+  Serial.print(", TX=D"); Serial.println(TMC1_TX);
+  Serial.print("  Bus2: RX=D"); Serial.print(TMC2_RX);
+  Serial.print(", TX=D"); Serial.println(TMC2_TX);
+  
+  Serial.println("\nStarting scan...\n");
+  Serial.println("===============================================\n");
+  
+  delay(1000);
+  
+  int totalFound = 0;
+  
+  // Test Bus1 normal (D3 RX, D4 TX)
+  totalFound += testBusConfig(Serial1, TMC1_RX, TMC1_TX, "Bus1");
+  
+  // Test Bus2 normal (D9 RX, D10 TX)
+  totalFound += testBusConfig(Serial2, TMC2_RX, TMC2_TX, "Bus2");
+  
+  // Test Bus1 swapped (D4 RX, D3 TX)
+  totalFound += testBusConfig(Serial1, TMC1_TX, TMC1_RX, "Bus1-Swapped");
+  
+  // Test Bus2 swapped (D10 RX, D9 TX)
+  totalFound += testBusConfig(Serial2, TMC2_TX, TMC2_RX, "Bus2-Swapped");
+  
+  // Summary
+  Serial.println("===============================================");
+  Serial.println("SCAN COMPLETE");
+  Serial.println("===============================================\n");
+  
+  if (totalFound == 0) {
+    Serial.println("*** NO DRIVERS FOUND ***\n");
+    Serial.println("Possible issues:");
+    Serial.println("  1. UART not enabled - PDN_UART pin must be pulled HIGH (to 3.3V)");
+    Serial.println("     -> This is the most common issue! Check your PDN_UART wiring");
+    Serial.println("  2. Drivers not powered (check VIO = 3.3V, VM = 12-24V)");
+    Serial.println("  3. Wrong pins - check your wiring matches D3/D4 or D9/D10");
+    Serial.println("  4. Faulty drivers or connections");
+    Serial.println("  5. UART TX/RX lines may need 1k series resistors");
+  } else if (totalFound == 1) {
+    Serial.println("WARNING: ONLY 1 DRIVER FOUND\n");
+    Serial.println("Expected 2 drivers. Check the second driver:");
+    Serial.println("  - Power connections");
+    Serial.println("  - UART wiring");
+    Serial.println("  - PDN_UART pin");
+  } else if (totalFound == 2) {
+    Serial.println("SUCCESS: BOTH DRIVERS FOUND\n");
+    Serial.println("Use the configurations shown above in your main code!");
+  } else {
+    Serial.println("WARNING: Found more than 2 drivers - possible address conflicts!");
+  }
+  
+  Serial.println("\n===============================================");
+  Serial.println("Continuous monitoring mode starting...");
+  Serial.println("Will re-scan every 10 seconds");
+  Serial.println("===============================================\n");
+}
+
+void loop() {
+  static unsigned long lastScan = 0;
+  
+  if (millis() - lastScan > 10000) {
+    lastScan = millis();
+    
+    Serial.println("\n[Quick Re-scan]");
+    
+    // Quick scan Bus1
+    Serial1.setRX(TMC1_RX);
+    Serial1.setTX(TMC1_TX);
+    Serial1.begin(115200);
+    delay(50);
+    
+    for (int addr = 0; addr < 4; addr++) {
+      TMC2209Stepper driver(&Serial1, R_SENSE, addr);
+      driver.begin();
+      delay(10);
+      uint8_t v = driver.version();
+      
+      if (v != 0 && v != 0xFF) {
+        uint32_t ioin = driver.IOIN();
+        bool uart_en = (ioin >> 1) & 0x01;
+        Serial.print("Bus1 addr ");
+        Serial.print(addr);
+        Serial.print(": OK (0x");
+        Serial.print(v, HEX);
+        Serial.print(") UART_EN=");
+        Serial.println(uart_en ? "YES" : "NO");
+      }
+    }
+    Serial1.end();
+    
+    // Quick scan Bus2
+    Serial2.setRX(TMC2_RX);
+    Serial2.setTX(TMC2_TX);
+    Serial2.begin(115200);
+    delay(50);
+    
+    for (int addr = 0; addr < 4; addr++) {
+      TMC2209Stepper driver(&Serial2, R_SENSE, addr);
+      driver.begin();
+      delay(10);
+      uint8_t v = driver.version();
+      
+      if (v != 0 && v != 0xFF) {
+        uint32_t ioin = driver.IOIN();
+        bool uart_en = (ioin >> 1) & 0x01;
+        Serial.print("Bus2 addr ");
+        Serial.print(addr);
+        Serial.print(": OK (0x");
+        Serial.print(v, HEX);
+        Serial.print(") UART_EN=");
+        Serial.println(uart_en ? "YES" : "NO");
+      }
+    }
+    Serial2.end();
+  }
+  
+  delay(100);
+}
