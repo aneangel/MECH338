@@ -29,22 +29,32 @@ import serial.tools.list_ports
 
 
 def find_motor_controller():
-    """Find XIAO ESP32-S3."""
-    ports = serial.tools.list_ports.comports()
-    for port in ports:
-        if port.vid == 0x303A and port.pid == 0x1001:
-            return port.device
-    return None
-
-
-def find_ir_sensor_board():
-    """Find XIAO RP2350 (IR sensor board)."""
+    """Find XIAO RP2350 (now used as motor controller in STEP/DIR mode)."""
     ports = serial.tools.list_ports.comports()
     for port in ports:
         # XIAO RP2350 USB VID/PID
         if port.vid == 0x2886 and port.pid == 0x58:
             return port.device
+    # Fallback: Try ESP32-S3 (legacy UART mode - commented out)
+    # for port in ports:
+    #     if port.vid == 0x303A and port.pid == 0x1001:
+    #         return port.device
     return None
+
+
+def find_ir_sensor_board():
+    """Find IR sensor board (separate RP2350 if using two boards)."""
+    ports = serial.tools.list_ports.comports()
+    # If using a second RP2350 for IR sensors only, detect it here
+    # For now, IR sensors are on the same board as motor controller
+    # so this function returns None
+    return None
+    # Uncomment below if you have a dedicated IR sensor board:
+    # for port in ports:
+    #     if port.vid == 0x2886 and port.pid == 0x58:
+    #         # Would need additional logic to distinguish between two RP2350s
+    #         return port.device
+    # return None
 
 
 class SimpleMotorController:
@@ -54,7 +64,7 @@ class SimpleMotorController:
         if port is None:
             port = find_motor_controller()
             if port is None:
-                print("ERROR: Could not find XIAO ESP32-S3")
+                print("ERROR: Could not find XIAO RP2350 motor controller")
                 sys.exit(1)
         
         self.port = port
@@ -78,7 +88,7 @@ class SimpleMotorController:
         try:
             print(f"Connecting to motor controller at {self.port}...")
             self.ser = serial.Serial(self.port, 115200, timeout=1)
-            time.sleep(2)  # Wait for ESP32 to boot
+            time.sleep(2)  # Wait for RP2350 to boot
             
             # Clear buffer
             while self.ser.in_waiting:
@@ -94,8 +104,9 @@ class SimpleMotorController:
                 print("✗ Ping failed")
                 return False
             
-            # Connect to IR sensor board if enabled
-            if self.enable_ir_monitor:
+            # IR sensor monitoring disabled - sensors on same RP2350 board
+            # (IR monitoring would need to be handled via JSON commands or separate board)
+            if self.enable_ir_monitor and False:  # Disabled for single-board setup
                 if self.ir_sensor_port is None:
                     self.ir_sensor_port = find_ir_sensor_board()
                 

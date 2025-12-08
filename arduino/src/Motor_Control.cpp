@@ -36,7 +36,7 @@ const uint8_t  HOME_SGTHRS        = 5;
 const uint16_t HOME_STEP_DELAY_US = 1200;
 const uint16_t BACKOFF_STEPS      = 800;
 const uint16_t BACKOFF_DELAY_US   = 1000;
-const uint32_t MAX_HOME_STEPS     = 42550;
+const uint32_t MAX_HOME_STEPS     = 44500;
 const uint8_t  STALL_STOP_STEPS   = 15;
 
 // Motion parameters
@@ -465,6 +465,34 @@ void handleStopCommand() {
   sendResponse("stop", "ok");
 }
 
+void handleLocalizeCommand(JsonDocument &doc) {
+  // Set position from vision-based localization
+  // This allows recovery from arbitrary positions without full homing
+  if (!doc["x"].is<float>() || !doc["y"].is<float>()) {
+    sendResponse("localize", "failed", "Missing x or y");
+    return;
+  }
+  
+  float new_x = doc["x"] | 0.0f;
+  float new_y = doc["y"] | 0.0f;
+  
+  // Validate coordinates are within known bounds
+  if (new_x < x_min || new_x > x_max || new_y < y_min || new_y > y_max) {
+    sendResponse("localize", "failed", "Position out of bounds");
+    return;
+  }
+  
+  // Update current position
+  cur_x_mm = new_x;
+  cur_y_mm = new_y;
+  
+  // Stop any ongoing motion
+  target_x_vel = 0.0f;
+  target_y_vel = 0.0f;
+  
+  sendResponse("localize", "ok");
+}
+
 void handleStatusCommand() {
   JsonDocument doc;
   doc["cmd"] = "status";
@@ -513,6 +541,8 @@ void processSerialCommands() {
             handleVelocityCommand(doc);
           } else if (strcmp(cmd, "stop") == 0) {
             handleStopCommand();
+          } else if (strcmp(cmd, "localize") == 0) {
+            handleLocalizeCommand(doc);
           } else if (strcmp(cmd, "status") == 0) {
             handleStatusCommand();
           } else {
@@ -542,14 +572,23 @@ void updateVelocityControl() {
       float new_x = cur_x_mm + (target_x_vel * dt);
       float new_y = cur_y_mm + (target_y_vel * dt);
       
-      // Boundary check
+      // Boundary check - stop before hitting edges
       if (homed) {
+        // Check if we're at or beyond boundaries
+        bool at_x_min = (new_x <= x_min);
+        bool at_x_max = (new_x >= x_max);
+        bool at_y_min = (new_y <= y_min);
+        bool at_y_max = (new_y >= y_max);
+        
+        // Clamp position to boundaries
         new_x = constrain(new_x, x_min, x_max);
         new_y = constrain(new_y, y_min, y_max);
         
-        // Stop if we hit boundary
-        if (new_x <= x_min || new_x >= x_max) target_x_vel = 0.0f;
-        if (new_y <= y_min || new_y >= y_max) target_y_vel = 0.0f;
+        // Stop velocity if we hit boundary
+        if (at_x_min && target_x_vel < 0) target_x_vel = 0.0f;  // Stopped at min, moving neg
+        if (at_x_max && target_x_vel > 0) target_x_vel = 0.0f;  // Stopped at max, moving pos
+        if (at_y_min && target_y_vel < 0) target_y_vel = 0.0f;
+        if (at_y_max && target_y_vel > 0) target_y_vel = 0.0f;
       }
       
       move_to_xy_mm(new_x, new_y, 100);  // Fast update
