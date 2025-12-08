@@ -1,17 +1,15 @@
 #include <Arduino.h>
 #include <TMCStepper.h>
+#include <ArduinoJson.h>
 #include <math.h>
 
 // ====================== USER CONFIG ======================
 
-// TMC sense resistor (BTT 2209 is usually 0.11Ω)
 #define R_SENSE        0.11f
 
 // UART bus (XIAO RP2350)
-// MCU_TX (D6) -> 2.2k -> PDN/UART bus on both TMC2209s
-// MCU_RX (D7) -> PDN/UART bus
-#define TMC_UART_RX    D7     // PDN bus -> XIAO RX
-#define TMC_UART_TX    D6     // XIAO TX -> 2.2k -> PDN bus
+#define TMC_UART_RX    D7
+#define TMC_UART_TX    D6
 
 // CoreXY motor A
 #define A_STEP_PIN     D1
@@ -23,130 +21,84 @@
 #define B_DIR_PIN      D2
 #define B_EN_PIN       D8
 
-// DIAG pins for sensorless homing (one per driver)
+// DIAG pins for sensorless homing
 #define A_DIAG_PIN     D10
 #define B_DIAG_PIN     D9
 
-// ---------- CoreXY direction config ----------
-// Tune these so:
-//  - X_NEG_* really moves toward X-min
-//  - Y_NEG_* really moves toward Y-min
-
-// "X- move" direction (CoreXY: both motors same way)
+// CoreXY direction config
 #define X_NEG_A_DIR    HIGH
 #define X_NEG_B_DIR    HIGH
-
-// "Y- move" direction (CoreXY: motors opposite ways)
 #define Y_NEG_A_DIR    HIGH
 #define Y_NEG_B_DIR    LOW
 
-// Homing parameters - Tuned for actual edge detection
-const uint8_t  HOME_SGTHRS        = 5;      // LOWER = more sensitive (0-255, typically 0-10 for homing)
-const uint16_t HOME_STEP_DELAY_US = 1200;   // Slower = more reliable stall detection
-const uint16_t BACKOFF_STEPS      = 800;    // Steps to back off after stall
-const uint16_t BACKOFF_DELAY_US   = 1000;   // Backoff speed
-const uint32_t MAX_HOME_STEPS     = 45000;  // Increased safety limit to reach all edges
-const uint8_t  STALL_STOP_STEPS   = 15;     // Require sustained stall (filter noise)
+// Homing parameters
+const uint8_t  HOME_SGTHRS        = 5;
+const uint16_t HOME_STEP_DELAY_US = 1200;
+const uint16_t BACKOFF_STEPS      = 800;
+const uint16_t BACKOFF_DELAY_US   = 1000;
+const uint32_t MAX_HOME_STEPS     = 42550;
+const uint8_t  STALL_STOP_STEPS   = 15;
 
-// --------- Motion / circle parameters ----------
+// Motion parameters
+const float STEPS_PER_MM = 160.0f;   // Adjust for your setup
 
-// Approx steps/mm (adjust for your pulley & microstepping)
-const float STEPS_PER_MM = 160.0f;   // 0.9° motor, 16x, 20T pulley -> ~160
-
-// Circle settings (in mm, in XY space)
-// After homing, origin (0,0) is at bottom-left corner
-const float CIRCLE_RADIUS_MM    = 10.0f;  // Small radius for safety
-const float CIRCLE_CENTER_X_MM  = 20.0f;  // Safe distance from left edge
-const float CIRCLE_CENTER_Y_MM  = 12.0f;  // Safe distance from bottom edge
-
-const int   CIRCLE_SEGMENTS        = 240;   // resolution of the circle
-const uint16_t CIRCLE_STEP_DELAY_US = 250;  // Faster speed (was 500)
-
-// =========================================================
-
-// On RP2350/RP2040 we use Serial1 directly for the TMC bus
-
-TMC2209Stepper drvA(&Serial1, R_SENSE, 0b00);  // A: MS1=0, MS2=0
-TMC2209Stepper drvB(&Serial1, R_SENSE, 0b01);  // B: MS1=1, MS2=0 (example)
-
-// Global flag: only home if both drivers respond
-bool drivers_ok = false;
-
-// Track our "logical" XY position in mm
-static float cur_x_mm = 0.0f;
-static float cur_y_mm = 0.0f;
-
-// For motor "positive" directions (belt direction)
-// If circle runs mirrored, you can flip these.
+// CoreXY motor directions
 const uint8_t A_DIR_POS = HIGH;
 const uint8_t B_DIR_POS = HIGH;
 
-// ------------------ TMC config helpers -------------------
+// =========================================================
+
+TMC2209Stepper drvA(&Serial1, R_SENSE, 0b00);
+TMC2209Stepper drvB(&Serial1, R_SENSE, 0b01);
+
+bool drivers_ok = false;
+bool motors_enabled = false;
+bool homed = false;
+
+// Current position in mm
+float cur_x_mm = 0.0f;
+float cur_y_mm = 0.0f;
+
+// Workspace limits (set by homing)
+float x_min = 0.0f;
+float x_max = 70.0f;  // Default, will be measured
+float y_min = 0.0f;
+float y_max = 35.0f;  // Default, will be measured
+
+// Velocity control
+float target_x_vel = 0.0f;  // mm/s
+float target_y_vel = 0.0f;  // mm/s
+unsigned long last_move_time = 0;
+const uint16_t VELOCITY_UPDATE_MS = 20;  // Update position every 20ms
+
+// ================= TMC CONFIGURATION ====================
 
 void config_tmc_driver(TMC2209Stepper &drv) {
   drv.begin();
   drv.pdn_disable(true);
   drv.I_scale_analog(false);
-
   drv.toff(4);
   drv.blank_time(24);
   drv.microsteps(16);
-  drv.rms_current(1500);      // Increase if motors are weak
-
+  drv.rms_current(1500);
   drv.en_spreadCycle(false);
   drv.pwm_autoscale(true);
-
-  // StallGuard config
-  drv.TCOOLTHRS(0xFFFFF);     // Enable StallGuard (DIAG output when velocity > TCOOLTHRS)
-  drv.SGTHRS(HOME_SGTHRS);    // StallGuard threshold
-  drv.shaft(false);           // Motor direction
+  drv.TCOOLTHRS(0xFFFFF);
+  drv.SGTHRS(HOME_SGTHRS);
+  drv.shaft(false);
 }
 
-// Simple UART connection check
 void check_tmc_connections() {
-  Serial.println(F("\n=== TMC2209 UART connection check ==="));
-
-  // Driver A
   uint8_t connA = drvA.test_connection();
-  Serial.print(F("Driver A (addr 0b00): "));
-  if (connA == 0)      Serial.print(F("OK"));
-  else if (connA == 1) Serial.print(F("No connection"));
-  else if (connA == 2) Serial.print(F("Bad response"));
-  else                 Serial.print(connA);
-  Serial.print(F("  | IFCNT="));
-  Serial.println(drvA.IFCNT());
-
-  // Driver B
   uint8_t connB = drvB.test_connection();
-  Serial.print(F("Driver B (addr 0b01): "));
-  if (connB == 0)      Serial.print(F("OK"));
-  else if (connB == 1) Serial.print(F("No connection"));
-  else if (connB == 2) Serial.print(F("Bad response"));
-  else                 Serial.print(connB);
-  Serial.print(F("  | IFCNT="));
-  Serial.println(drvB.IFCNT());
-
-  if (connA == 0 && connB == 0) {
-    drivers_ok = true;
-    Serial.println(F("=> Both drivers respond over UART. Continuing.\n"));
-  } else {
-    drivers_ok = false;
-    Serial.println(F("=> UART check FAILED. Skipping motion.\n"));
-  }
+  drivers_ok = (connA == 0 && connB == 0);
 }
 
-// ------------------- CoreXY helpers ----------------------
+// ================= MOTION HELPERS =======================
 
-// DIAG is treated as HIGH on stall / error.
-inline bool stall_A() {
-  return digitalRead(A_DIAG_PIN) == HIGH;
-}
+inline bool stall_A() { return digitalRead(A_DIAG_PIN) == HIGH; }
+inline bool stall_B() { return digitalRead(B_DIAG_PIN) == HIGH; }
 
-inline bool stall_B() {
-  return digitalRead(B_DIAG_PIN) == HIGH;
-}
-
-// Step helper: pulse both motors once
 inline void step_both(uint16_t pulse_us) {
   digitalWrite(A_STEP_PIN, HIGH);
   digitalWrite(B_STEP_PIN, HIGH);
@@ -155,8 +107,8 @@ inline void step_both(uint16_t pulse_us) {
   digitalWrite(B_STEP_PIN, LOW);
 }
 
-// Step helper for arbitrary delta in A/B (CoreXY space)
-void step_corexy_AB_delta(int32_t dA, int32_t dB) {
+// Step motors with CoreXY kinematics: A = X + Y, B = X - Y
+void step_corexy_AB_delta(int32_t dA, int32_t dB, uint16_t step_delay_us) {
   int32_t stepsA = abs(dA);
   int32_t stepsB = abs(dB);
   int32_t maxSteps = max(stepsA, stepsB);
@@ -193,93 +145,70 @@ void step_corexy_AB_delta(int32_t dA, int32_t dB) {
       accB -= 1.0f;
     }
 
-    delayMicroseconds(CIRCLE_STEP_DELAY_US);
+    delayMicroseconds(step_delay_us);
   }
 }
 
-// Move in XY (mm) using CoreXY mapping
-// CoreXY: A = X + Y, B = X - Y (up to sign conventions)
-void move_to_xy_mm(float x_target, float y_target) {
+// Move to absolute XY position (boundary checked)
+bool move_to_xy_mm(float x_target, float y_target, uint16_t step_delay_us = 500) {
+  // Boundary check
+  if (homed) {
+    x_target = constrain(x_target, x_min, x_max);
+    y_target = constrain(y_target, y_min, y_max);
+  }
+
   float dx = x_target - cur_x_mm;
   float dy = y_target - cur_y_mm;
 
+  // CoreXY kinematics: A = X + Y, B = X - Y
   float dA_f = (dx + dy) * STEPS_PER_MM;
   float dB_f = (dx - dy) * STEPS_PER_MM;
 
   int32_t dA = (int32_t)lroundf(dA_f);
   int32_t dB = (int32_t)lroundf(dB_f);
 
-  if (dA == 0 && dB == 0) return;
+  if (dA == 0 && dB == 0) return true;
 
-  step_corexy_AB_delta(dA, dB);
+  step_corexy_AB_delta(dA, dB, step_delay_us);
 
   cur_x_mm = x_target;
   cur_y_mm = y_target;
+  return true;
 }
 
-// --------------- Axis homing functions -------------------
+// ================= SENSORLESS HOMING ===================
 
-// Home to X-min - WITH DEBUG OUTPUT
 void home_x_min_sensorless() {
-  Serial.println(F("\n=== Homing X-min (CoreXY, sensorless) ==="));
-
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
-  delay(200);  // Longer enable delay
+  delay(200);
 
   digitalWrite(A_DIR_PIN, X_NEG_A_DIR);
   digitalWrite(B_DIR_PIN, X_NEG_B_DIR);
-  delay(100);  // Longer direction setup
+  delay(100);
 
   uint32_t steps = 0;
   uint8_t stall_count = 0;
-  
-  Serial.println(F("Moving toward X-min..."));
 
   while (steps < MAX_HOME_STEPS) {
     step_both(5);
     delayMicroseconds(HOME_STEP_DELAY_US);
 
-    bool a_stall = stall_A();
-    bool b_stall = stall_B();
-    
-    // Debug output every 1000 steps
-    if (steps % 1000 == 0) {
-      Serial.print(F("Steps: "));
-      Serial.print(steps);
-      Serial.print(F(" | DIAG_A: "));
-      Serial.print(a_stall ? "HIGH" : "LOW");
-      Serial.print(F(" | DIAG_B: "));
-      Serial.println(b_stall ? "HIGH" : "LOW");
-    }
-
-    if (a_stall || b_stall) {
+    if (stall_A() || stall_B()) {
       stall_count++;
-      if (stall_count >= STALL_STOP_STEPS) {
-        Serial.print(F("X-min STALL detected at steps="));
-        Serial.println(steps);
-        break;
-      }
+      if (stall_count >= STALL_STOP_STEPS) break;
     } else {
       stall_count = 0;
     }
     steps++;
   }
 
-  if (stall_count < STALL_STOP_STEPS) {
-    Serial.println(F("!! X-min homing aborted: MAX_HOME_STEPS reached"));
-    Serial.println(F("!! Check: 1) Motors moving? 2) DIAG wiring? 3) SGTHRS too high?"));
-    return;
-  }
-
-  // STOP motors immediately after stall
-  digitalWrite(A_EN_PIN, HIGH);  // Disable motors
+  digitalWrite(A_EN_PIN, HIGH);
   digitalWrite(B_EN_PIN, HIGH);
   delay(100);
 
   // Back off
-  Serial.println(F("Backing off from X-min endstop..."));
-  digitalWrite(A_EN_PIN, LOW);   // Re-enable for backoff
+  digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(50);
   digitalWrite(A_DIR_PIN, !X_NEG_A_DIR);
@@ -292,13 +221,10 @@ void home_x_min_sensorless() {
   }
 
   cur_x_mm = 0.0f;
-  Serial.println(F("X-min homing complete. X=0 set here."));
+  x_min = 0.0f;
 }
 
-// Home to X-max - WITH DEBUG OUTPUT
 void home_x_max_sensorless() {
-  Serial.println(F("\n=== Homing X-max (CoreXY, sensorless) ==="));
-
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(200);
@@ -309,50 +235,29 @@ void home_x_max_sensorless() {
 
   uint32_t steps = 0;
   uint8_t stall_count = 0;
-  
-  Serial.println(F("Moving toward X-max..."));
+  float start_x = cur_x_mm;
 
   while (steps < MAX_HOME_STEPS) {
     step_both(5);
     delayMicroseconds(HOME_STEP_DELAY_US);
 
-    bool a_stall = stall_A();
-    bool b_stall = stall_B();
-    
-    if (steps % 1000 == 0) {
-      Serial.print(F("Steps: "));
-      Serial.print(steps);
-      Serial.print(F(" | DIAG_A: "));
-      Serial.print(a_stall ? "HIGH" : "LOW");
-      Serial.print(F(" | DIAG_B: "));
-      Serial.println(b_stall ? "HIGH" : "LOW");
-    }
-
-    if (a_stall || b_stall) {
+    if (stall_A() || stall_B()) {
       stall_count++;
-      if (stall_count >= STALL_STOP_STEPS) {
-        Serial.print(F("X-max STALL detected at steps="));
-        Serial.println(steps);
-        break;
-      }
+      if (stall_count >= STALL_STOP_STEPS) break;
     } else {
       stall_count = 0;
     }
     steps++;
   }
 
-  if (stall_count < STALL_STOP_STEPS) {
-    Serial.println(F("!! X-max homing aborted: MAX_HOME_STEPS reached"));
-    Serial.println(F("!! Check: 1) Motors moving? 2) DIAG wiring? 3) SGTHRS too high?"));
-    return;
-  }
-
-  // STOP motors immediately after stall
   digitalWrite(A_EN_PIN, HIGH);
   digitalWrite(B_EN_PIN, HIGH);
   delay(100);
 
-  Serial.println(F("Backing off from X-max endstop..."));
+  // Calculate X max from steps traveled
+  x_max = start_x + (steps / STEPS_PER_MM);
+
+  // Back off
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(50);
@@ -364,14 +269,9 @@ void home_x_max_sensorless() {
     step_both(5);
     delayMicroseconds(BACKOFF_DELAY_US);
   }
-
-  Serial.println(F("X-max homing complete."));
 }
 
-// Home to Y-min - WITH DEBUG OUTPUT
 void home_y_min_sensorless() {
-  Serial.println(F("\n=== Homing Y-min (CoreXY, sensorless) ==="));
-
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(200);
@@ -382,50 +282,25 @@ void home_y_min_sensorless() {
 
   uint32_t steps = 0;
   uint8_t stall_count = 0;
-  
-  Serial.println(F("Moving toward Y-min..."));
 
   while (steps < MAX_HOME_STEPS) {
     step_both(5);
     delayMicroseconds(HOME_STEP_DELAY_US);
 
-    bool a_stall = stall_A();
-    bool b_stall = stall_B();
-    
-    if (steps % 1000 == 0) {
-      Serial.print(F("Steps: "));
-      Serial.print(steps);
-      Serial.print(F(" | DIAG_A: "));
-      Serial.print(a_stall ? "HIGH" : "LOW");
-      Serial.print(F(" | DIAG_B: "));
-      Serial.println(b_stall ? "HIGH" : "LOW");
-    }
-
-    if (a_stall || b_stall) {
+    if (stall_A() || stall_B()) {
       stall_count++;
-      if (stall_count >= STALL_STOP_STEPS) {
-        Serial.print(F("Y-min STALL detected at steps="));
-        Serial.println(steps);
-        break;
-      }
+      if (stall_count >= STALL_STOP_STEPS) break;
     } else {
       stall_count = 0;
     }
     steps++;
   }
 
-  if (stall_count < STALL_STOP_STEPS) {
-    Serial.println(F("!! Y-min homing aborted: MAX_HOME_STEPS reached"));
-    Serial.println(F("!! Check: 1) Motors moving? 2) DIAG wiring? 3) SGTHRS too high?"));
-    return;
-  }
-
-  // STOP motors immediately after stall
   digitalWrite(A_EN_PIN, HIGH);
   digitalWrite(B_EN_PIN, HIGH);
   delay(100);
 
-  Serial.println(F("Backing off from Y-min endstop..."));
+  // Back off
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(50);
@@ -439,13 +314,10 @@ void home_y_min_sensorless() {
   }
 
   cur_y_mm = 0.0f;
-  Serial.println(F("Y-min homing complete. Y=0 set here."));
+  y_min = 0.0f;
 }
 
-// Home to Y-max - WITH DEBUG OUTPUT
 void home_y_max_sensorless() {
-  Serial.println(F("\n=== Homing Y-max (CoreXY, sensorless) ==="));
-
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(200);
@@ -456,50 +328,29 @@ void home_y_max_sensorless() {
 
   uint32_t steps = 0;
   uint8_t stall_count = 0;
-  
-  Serial.println(F("Moving toward Y-max..."));
+  float start_y = cur_y_mm;
 
   while (steps < MAX_HOME_STEPS) {
     step_both(5);
     delayMicroseconds(HOME_STEP_DELAY_US);
 
-    bool a_stall = stall_A();
-    bool b_stall = stall_B();
-    
-    if (steps % 1000 == 0) {
-      Serial.print(F("Steps: "));
-      Serial.print(steps);
-      Serial.print(F(" | DIAG_A: "));
-      Serial.print(a_stall ? "HIGH" : "LOW");
-      Serial.print(F(" | DIAG_B: "));
-      Serial.println(b_stall ? "HIGH" : "LOW");
-    }
-
-    if (a_stall || b_stall) {
+    if (stall_A() || stall_B()) {
       stall_count++;
-      if (stall_count >= STALL_STOP_STEPS) {
-        Serial.print(F("Y-max STALL detected at steps="));
-        Serial.println(steps);
-        break;
-      }
+      if (stall_count >= STALL_STOP_STEPS) break;
     } else {
       stall_count = 0;
     }
     steps++;
   }
 
-  if (stall_count < STALL_STOP_STEPS) {
-    Serial.println(F("!! Y-max homing aborted: MAX_HOME_STEPS reached"));
-    Serial.println(F("!! Check: 1) Motors moving? 2) DIAG wiring? 3) SGTHRS too high?"));
-    return;
-  }
-
-  // STOP motors immediately after stall
   digitalWrite(A_EN_PIN, HIGH);
   digitalWrite(B_EN_PIN, HIGH);
   delay(100);
 
-  Serial.println(F("Backing off from Y-max endstop..."));
+  // Calculate Y max from steps traveled
+  y_max = start_y + (steps / STEPS_PER_MM);
+
+  // Back off
   digitalWrite(A_EN_PIN, LOW);
   digitalWrite(B_EN_PIN, LOW);
   delay(50);
@@ -511,89 +362,228 @@ void home_y_max_sensorless() {
     step_both(5);
     delayMicroseconds(BACKOFF_DELAY_US);
   }
-
-  Serial.println(F("Y-max homing complete."));
 }
 
-// Fast calibration: Only map opposite corners (X-min/Y-min and X-max/Y-max)
 void calibrate_workspace() {
-  Serial.println(F("\n========================================"));
-  Serial.println(F("   FAST WORKSPACE CALIBRATION ROUTINE  "));
-  Serial.println(F("    Bottom-Left -> Top-Right Corner    "));
-  Serial.println(F("========================================\n"));
-  
-  // 1. Find bottom-left corner (X-min, Y-min)
-  Serial.println(F("Finding bottom-left corner..."));
   home_x_min_sensorless();
   delay(300);
   home_y_min_sensorless();
   delay(300);
-  
-  // 2. Find top-right corner (one axis at a time to avoid speed mismatch)
-  Serial.println(F("\nFinding top-right corner..."));
   home_x_max_sensorless();
   delay(300);
   home_y_max_sensorless();
   delay(300);
-  
-  // 3. Return to origin (bottom-left, one axis at a time)
-  Serial.println(F("\nReturning to origin..."));
   home_x_min_sensorless();
   delay(300);
   home_y_min_sensorless();
   delay(300);
   
-  Serial.println(F("\n========================================"));
-  Serial.println(F("   WORKSPACE CALIBRATION COMPLETE!    "));
-  Serial.println(F("   Origin at bottom-left corner (0,0) "));
-  Serial.println(F("========================================\n"));
+  homed = true;
 }
 
-// ---------------- Circle demo function -------------------
+// ================= JSON COMMAND HANDLING ================
 
-void run_circle_once() {
-  Serial.println(F("\n=== Running circle path ==="));
+void sendResponse(const char* cmd, const char* status, const char* message = nullptr) {
+  JsonDocument doc;
+  doc["cmd"] = cmd;
+  doc["status"] = status;
+  if (message) doc["message"] = message;
+  doc["x"] = cur_x_mm;
+  doc["y"] = cur_y_mm;
+  doc["homed"] = homed;
+  doc["enabled"] = motors_enabled;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
 
-  // Move to starting point (rightmost point of circle)
-  float start_x = CIRCLE_CENTER_X_MM + CIRCLE_RADIUS_MM;
-  float start_y = CIRCLE_CENTER_Y_MM;
-  
-  Serial.print(F("Moving to circle start: ("));
-  Serial.print(start_x);
-  Serial.print(F(", "));
-  Serial.print(start_y);
-  Serial.println(F(")"));
-  
-  move_to_xy_mm(start_x, start_y);
-  delay(500);
+void handlePingCommand() {
+  sendResponse("ping", "ok", "pong");
+}
 
-  // Execute circle
-  Serial.println(F("Tracing circle..."));
+void handleEnableCommand(JsonDocument& doc) {
+  bool state = doc["state"] | true;
   
-  for (int i = 0; i <= CIRCLE_SEGMENTS; i++) {
-    float angle = (2.0f * PI * i) / CIRCLE_SEGMENTS;
-    float x = CIRCLE_CENTER_X_MM + CIRCLE_RADIUS_MM * cosf(angle);
-    float y = CIRCLE_CENTER_Y_MM + CIRCLE_RADIUS_MM * sinf(angle);
-    
-    move_to_xy_mm(x, y);
+  digitalWrite(A_EN_PIN, state ? LOW : HIGH);
+  digitalWrite(B_EN_PIN, state ? LOW : HIGH);
+  motors_enabled = state;
+  
+  sendResponse("enable", "ok", state ? "Motors enabled" : "Motors disabled");
+}
+
+void handleHomeCommand(JsonDocument& doc) {
+  if (!motors_enabled) {
+    sendResponse("home", "error", "Motors not enabled");
+    return;
   }
-
-  Serial.println(F("Circle complete!\n"));
+  
+  // Send starting message
+  JsonDocument startDoc;
+  startDoc["cmd"] = "home";
+  startDoc["status"] = "in_progress";
+  startDoc["message"] = "Starting homing sequence";
+  serializeJson(startDoc, Serial);
+  Serial.println();
+  
+  calibrate_workspace();
+  
+  // Send completion message
+  sendResponse("home", "ok", "Homing complete");
 }
 
-// ------------------------ SETUP/LOOP ---------------------
+void handleMoveCommand(JsonDocument& doc) {
+  if (!motors_enabled) {
+    sendResponse("move", "error", "Motors not enabled");
+    return;
+  }
+  
+  float x = doc["x"] | cur_x_mm;
+  float y = doc["y"] | cur_y_mm;
+  
+  move_to_xy_mm(x, y, 300);
+  sendResponse("move", "ok");
+}
+
+void handleVelocityCommand(JsonDocument& doc) {
+  if (!motors_enabled) {
+    sendResponse("velocity", "error", "Motors not enabled");
+    return;
+  }
+  
+  target_x_vel = doc["x_vel"] | 0.0f;
+  target_y_vel = doc["y_vel"] | 0.0f;
+  
+  // Constrain velocity to reasonable limits
+  target_x_vel = constrain(target_x_vel, -200.0f, 200.0f);
+  target_y_vel = constrain(target_y_vel, -200.0f, 200.0f);
+  
+  sendResponse("velocity", "ok");
+}
+
+void handleStopCommand() {
+  target_x_vel = 0.0f;
+  target_y_vel = 0.0f;
+  sendResponse("stop", "ok");
+}
+
+void handleStatusCommand() {
+  JsonDocument doc;
+  doc["cmd"] = "status";
+  doc["status"] = "ok";
+  doc["x"] = cur_x_mm;
+  doc["y"] = cur_y_mm;
+  doc["x_min"] = x_min;
+  doc["x_max"] = x_max;
+  doc["y_min"] = y_min;
+  doc["y_max"] = y_max;
+  doc["homed"] = homed;
+  doc["enabled"] = motors_enabled;
+  doc["x_vel"] = target_x_vel;
+  doc["y_vel"] = target_y_vel;
+  serializeJson(doc, Serial);
+  Serial.println();
+}
+
+void processSerialCommands() {
+  static String jsonBuffer = "";
+  
+  while (Serial.available()) {
+    char c = Serial.read();
+    
+    if (c == '\n') {
+      if (jsonBuffer.length() > 0) {
+        JsonDocument doc;
+        DeserializationError error = deserializeJson(doc, jsonBuffer);
+        
+        if (error) {
+          sendResponse("error", "failed", "Invalid JSON");
+        } else {
+          const char* cmd = doc["cmd"];
+          
+          if (!cmd) {
+            sendResponse("error", "failed", "Missing cmd field");
+          } else if (strcmp(cmd, "ping") == 0) {
+            handlePingCommand();
+          } else if (strcmp(cmd, "enable") == 0) {
+            handleEnableCommand(doc);
+          } else if (strcmp(cmd, "home") == 0) {
+            handleHomeCommand(doc);
+          } else if (strcmp(cmd, "move") == 0) {
+            handleMoveCommand(doc);
+          } else if (strcmp(cmd, "velocity") == 0) {
+            handleVelocityCommand(doc);
+          } else if (strcmp(cmd, "stop") == 0) {
+            handleStopCommand();
+          } else if (strcmp(cmd, "status") == 0) {
+            handleStatusCommand();
+          } else {
+            sendResponse("error", "failed", "Unknown command");
+          }
+        }
+        
+        jsonBuffer = "";
+      }
+    } else {
+      jsonBuffer += c;
+      if (jsonBuffer.length() > 512) {
+        jsonBuffer = "";
+      }
+    }
+  }
+}
+
+// Update position based on velocity
+void updateVelocityControl() {
+  unsigned long now = millis();
+  
+  if (now - last_move_time >= VELOCITY_UPDATE_MS) {
+    float dt = (now - last_move_time) / 1000.0f;  // seconds
+    
+    if (target_x_vel != 0.0f || target_y_vel != 0.0f) {
+      float new_x = cur_x_mm + (target_x_vel * dt);
+      float new_y = cur_y_mm + (target_y_vel * dt);
+      
+      // Boundary check
+      if (homed) {
+        new_x = constrain(new_x, x_min, x_max);
+        new_y = constrain(new_y, y_min, y_max);
+        
+        // Stop if we hit boundary
+        if (new_x <= x_min || new_x >= x_max) target_x_vel = 0.0f;
+        if (new_y <= y_min || new_y >= y_max) target_y_vel = 0.0f;
+      }
+      
+      move_to_xy_mm(new_x, new_y, 100);  // Fast update
+    }
+    
+    last_move_time = now;
+  }
+}
+
+// Check for serial timeout - stop if no commands received
+void checkSerialTimeout() {
+  static unsigned long last_serial_time = 0;
+  const unsigned long SERIAL_TIMEOUT_MS = 2000;  // 2 seconds
+  
+  if (Serial.available()) {
+    last_serial_time = millis();
+  }
+  
+  // If no serial data for 2 seconds, stop motors
+  if (motors_enabled && (millis() - last_serial_time > SERIAL_TIMEOUT_MS)) {
+    target_x_vel = 0.0f;
+    target_y_vel = 0.0f;
+  }
+}
+
+// ===================== SETUP/LOOP ======================
 
 void setup() {
   Serial.begin(115200);
   while (!Serial) {}
 
-  Serial.println();
-  Serial.println(F("CoreXY + 2x TMC2209 sensorless homing + circle demo (RP2350)"));
-
   pinMode(A_STEP_PIN, OUTPUT);
   pinMode(A_DIR_PIN,  OUTPUT);
   pinMode(A_EN_PIN,   OUTPUT);
-
   pinMode(B_STEP_PIN, OUTPUT);
   pinMode(B_DIR_PIN,  OUTPUT);
   pinMode(B_EN_PIN,   OUTPUT);
@@ -611,29 +601,17 @@ void setup() {
 
   config_tmc_driver(drvB);
   config_tmc_driver(drvA);
-
   check_tmc_connections();
 
-  if (!drivers_ok) {
-    Serial.println(F("Calibration skipped because UART check failed."));
-    return;
-  }
-
-  Serial.println(F("Starting workspace calibration in 3 seconds..."));
-  delay(3000);
-
-  calibrate_workspace();
-
-  Serial.println(F("Starting circle demo in 2 seconds..."));
-  delay(2000);
+  JsonDocument doc;
+  doc["status"] = "ready";
+  doc["drivers_ok"] = drivers_ok;
+  serializeJson(doc, Serial);
+  Serial.println();
 }
 
 void loop() {
-  if (!drivers_ok) {
-    delay(1000);
-    return;
-  }
-
-  run_circle_once();
-  delay(1000);   // pause between circles and repeat
+  processSerialCommands();
+  updateVelocityControl();
+  checkSerialTimeout();  // Stop motors if Python disconnects
 }
