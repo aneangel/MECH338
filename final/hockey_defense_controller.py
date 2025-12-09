@@ -40,7 +40,7 @@ def find_motor_controller():
     """Find XIAO RP2350 motor controller."""
     # MANUAL OVERRIDE: Set to specific port if you have multiple RP2350s
     # Uncomment one of these if auto-detect picks the wrong one:
-    return "/dev/ttyACM0"
+    return "/dev/ttyACM1"
     # return "/dev/ttyACM2"
     
     ports = serial.tools.list_ports.comports()
