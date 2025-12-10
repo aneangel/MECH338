@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <TMCStepper.h>
 #include <math.h>
+#include <pico/mutex.h>
 
 // ====================== USER CONFIG ======================
 
@@ -31,21 +32,20 @@
 #define Y_NEG_B_DIR    LOW
 
 // CoreXY motor directions (positive direction reference) for velocity mode
-// (leave as-is, this is what worked for you originally)
 const uint8_t A_DIR_POS = HIGH;
 const uint8_t B_DIR_POS = HIGH;
 
 // Motion parameters
 const float STEPS_PER_MM   = 160.0f;   // Adjust for your setup
-const float MAX_VELOCITY   = 6000.0f;   // mm/s max speed (limit for commands)
-const float MAX_ACCEL      = 60000.0f;  // mm/s^2 max accel
+const float MAX_VELOCITY   = 6000.0f;  // mm/s max speed (limit for commands)
+const float MAX_ACCEL      = 60000.0f; // mm/s^2 max accel
 
 // Velocity control timing
-const uint16_t VELOCITY_UPDATE_MS = 100;    // 10 Hz
+const uint16_t VELOCITY_UPDATE_MS = 20;    // 50 Hz for more responsive tracking
 
 // Sensorless homing parameters
 const uint16_t HOMING_STEP_DELAY_US  = 800;    // slow & safe toward wall
-const uint16_t CENTER_STEP_DELAY_US  = 50;    // faster centering move
+const uint16_t CENTER_STEP_DELAY_US  = 50;     // faster centering move
 const uint32_t HOMING_MAX_STEPS      = 200000; // failsafe limit
 const float    HOMING_BACKOFF_MM     = 10.0f;  // backoff distance after stall
 
@@ -53,7 +53,7 @@ const float    HOMING_BACKOFF_MM     = 10.0f;  // backoff distance after stall
 const float X_MIN   = 0.0f;
 const float X_MAX   = 300.0f;
 const float Y_MIN   = 0.0f;
-const float Y_MAX   = 280.0f;
+const float Y_MAX   = 230.0f;
 
 // Center of workspace
 const float X_CENTER = (X_MIN + X_MAX) * 0.5f;   // 150 mm
@@ -79,13 +79,32 @@ bool homed_y = false;
 float cur_x_mm = 0.0f;
 float cur_y_mm = 0.0f;
 
-// Velocity control
+// Velocity control (used by Core 1)
 float target_x_vel  = 0.0f;  // mm/s - commanded velocity
 float target_y_vel  = 0.0f;  // mm/s
 float current_x_vel = 0.0f;  // mm/s - ramped velocity
 float current_y_vel = 0.0f;  // mm/s
 
 unsigned long last_move_time = 0;
+
+// ================= DUAL-CORE COMMUNICATION ================
+
+// Mutex for thread-safe velocity updates between cores
+mutex_t velocity_mutex;
+
+// Shared velocity target (written by Core 0, read by Core 1)
+volatile float shared_target_x_vel = 0.0f;
+volatile float shared_target_y_vel = 0.0f;
+volatile bool  new_velocity_available = false;
+
+// Abort flag: Core 0 sets this to interrupt Core 1's step loop
+volatile bool abort_current_motion = false;
+
+// Flag to force immediate velocity update (bypass timing gate)
+volatile bool force_velocity_update = false;
+
+// Flag to block Core 1 during homing (Core 0 controls motors directly)
+volatile bool is_homing = false;
 
 // ================= TMC CONFIGURATION ====================
 
@@ -120,13 +139,22 @@ inline bool stall_B() {
   return digitalRead(B_DIAG_PIN) == HIGH;   // invert if needed
 }
 
-// Bresenham-style stepping for CoreXY A/B motors (used by velocity control)
-void step_corexy_AB_delta(int32_t dA, int32_t dB, uint16_t step_delay_us) {
+// Maximum steps per update to limit blocking time
+// 1000 steps * 50us = 50ms max blocking time per update
+const int32_t MAX_STEPS_PER_UPDATE = 1000;
+
+// Bresenham-style stepping for CoreXY A/B motors
+// Now checks abort_current_motion flag to allow early exit
+// Returns number of steps actually executed (for position tracking)
+int32_t step_corexy_AB_delta(int32_t dA, int32_t dB, uint16_t step_delay_us) {
   int32_t stepsA = abs(dA);
   int32_t stepsB = abs(dB);
   int32_t maxSteps = max(stepsA, stepsB);
 
-  if (maxSteps == 0) return;
+  if (maxSteps == 0) return 0;
+
+  // Cap steps to limit blocking time
+  int32_t stepsToExecute = min(maxSteps, MAX_STEPS_PER_UPDATE);
 
   uint8_t a_dir = (dA >= 0) ? A_DIR_POS : !A_DIR_POS;
   uint8_t b_dir = (dB >= 0) ? B_DIR_POS : !B_DIR_POS;
@@ -140,7 +168,15 @@ void step_corexy_AB_delta(int32_t dA, int32_t dB, uint16_t step_delay_us) {
   float accA = 0.0f;
   float accB = 0.0f;
 
-  for (int32_t i = 0; i < maxSteps; i++) {
+  int32_t stepsExecuted = 0;
+
+  for (int32_t i = 0; i < stepsToExecute; i++) {
+    // Check for abort every 10 steps (~0.5ms at 50us delay)
+    // This allows new velocity commands to interrupt quickly
+    if ((i % 10) == 0 && abort_current_motion) {
+      return stepsExecuted;  // Exit immediately, new command waiting
+    }
+
     accA += incA;
     accB += incB;
 
@@ -163,14 +199,18 @@ void step_corexy_AB_delta(int32_t dA, int32_t dB, uint16_t step_delay_us) {
       if (doA) digitalWrite(A_STEP_PIN, LOW);
       if (doB) digitalWrite(B_STEP_PIN, LOW);
       delayMicroseconds(step_delay_us);
+      stepsExecuted++;
     }
   }
+
+  return stepsExecuted;
 }
 
 // ================= SENSORLESS HOMING =====================
 
 // Home X- using sensorless stall detection, backoff 10mm, then go to X center
 void home_sensorless_X_neg() {
+  is_homing = true;  // Block Core 1 from motor control
   Serial.println("HOMEX (sensorless) START");
 
   // Stop velocity mode while homing
@@ -226,7 +266,6 @@ void home_sensorless_X_neg() {
 
   // Now we're ~10mm inside field from X- wall.
   // 3) Move to geometric center (150mm from wall):
-  // distance from our current position to center:
   float extra_to_center_mm = X_CENTER - HOMING_BACKOFF_MM;  // 150 - 10 = 140mm
 
   uint32_t center_steps = (uint32_t)lroundf(extra_to_center_mm * STEPS_PER_MM);
@@ -255,10 +294,12 @@ void home_sensorless_X_neg() {
   target_x_vel  = 0.0f;
   current_x_vel = 0.0f;
   last_cmd_time = millis();
+  is_homing = false;  // Allow Core 1 to resume
 }
 
 // Home Y- using sensorless stall detection, backoff 10mm, then go to Y center
 void home_sensorless_Y_neg() {
+  is_homing = true;  // Block Core 1 from motor control
   Serial.println("HOMEY (sensorless) START");
 
   // Stop velocity mode while homing
@@ -342,9 +383,10 @@ void home_sensorless_Y_neg() {
   target_y_vel  = 0.0f;
   current_y_vel = 0.0f;
   last_cmd_time = millis();
+  is_homing = false;  // Allow Core 1 to resume
 }
 
-// Optional: home both in sequence
+// Home both in sequence
 void home_sensorless_XY_neg() {
   home_sensorless_X_neg();
   home_sensorless_Y_neg();
@@ -366,16 +408,26 @@ float rampVelocity(float current, float target, float dt) {
 }
 
 // Update position based on velocity with acceleration limiting
+// Called by Core 1 only
 void updateVelocityControl() {
   if (!motors_enabled || !drivers_ok) return;
+  if (is_homing) return;  // Core 0 is homing, don't interfere
 
   unsigned long now = millis();
 
-  if (now - last_move_time < VELOCITY_UPDATE_MS) {
+  // Check if we should skip the timing gate (new command just arrived)
+  bool force_update = force_velocity_update;
+  if (force_update) {
+    force_velocity_update = false;  // Clear the flag
+  }
+
+  // Only gate on timing if not forced by a new command
+  if (!force_update && (now - last_move_time < VELOCITY_UPDATE_MS)) {
     return;
   }
 
   float dt = (now - last_move_time) / 1000.0f;  // seconds
+  if (dt <= 0.0f) dt = 0.01f;  // Minimum dt to avoid division issues
   last_move_time = now;
 
   // Clamp commanded targets
@@ -434,22 +486,30 @@ void updateVelocityControl() {
   float speed = sqrtf(current_x_vel * current_x_vel + current_y_vel * current_y_vel);
   uint16_t step_delay = (speed > 50.0f) ? 50 : 150;  // tweak as needed
 
-  step_corexy_AB_delta(dA, dB, step_delay);
+  int32_t maxSteps = max(abs(dA), abs(dB));
+  int32_t stepsExecuted = step_corexy_AB_delta(dA, dB, step_delay);
 
-  // Update estimated position (bounded already)
-  cur_x_mm += dx;
-  cur_y_mm += dy;
+  // Update estimated position based on ACTUAL steps executed, not planned
+  // This prevents position drift when steps are capped or aborted
+  if (maxSteps > 0 && stepsExecuted > 0) {
+    float fraction = (float)stepsExecuted / (float)maxSteps;
+    cur_x_mm += dx * fraction;
+    cur_y_mm += dy * fraction;
+  }
 }
 
-// ============= SERIAL: VELOCITY + HOMEX/HOMEY ============
+// ============= CORE 0: SERIAL HANDLING ===================
 //
 // Protocol:
 //   "vx vy\n"        -> velocity command (mm/s, floats, space or comma separated)
 //   "HOMEX\n"        -> sensorless home X- (backoff, then center X)
 //   "HOMEY\n"        -> sensorless home Y- (backoff, then center Y)
 //   "HOME\n"/"HOMEXY\n" -> home X then Y
+//
+// Core 0 handles all serial communication so it's always responsive,
+// even when Core 1 is busy stepping motors.
 
-void processSerial() {
+void processSerialCore0() {
   static char buf[64];
   static uint8_t idx = 0;
 
@@ -476,13 +536,21 @@ void processSerial() {
       }
 
       if (parsed == 2) {
-        // Velocity command
-        target_x_vel = vx;
-        target_y_vel = vy;
-        motors_enabled = true;       // auto-enable once we get a command
-        last_cmd_time = millis();    // update last command time
+        // Signal Core 1 to abort current motion immediately
+        abort_current_motion = true;
+        force_velocity_update = true;  // Bypass timing gate for immediate response
+
+        // Update shared velocity (thread-safe)
+        mutex_enter_blocking(&velocity_mutex);
+        shared_target_x_vel = vx;
+        shared_target_y_vel = vy;
+        new_velocity_available = true;
+        mutex_exit(&velocity_mutex);
+
+        motors_enabled = true;
+        last_cmd_time = millis();
       } else {
-        // String command
+        // String command - homing runs on Core 0 (blocking is OK during homing)
         if (strcmp(buf, "HOMEX") == 0) {
           home_sensorless_X_neg();
         } else if (strcmp(buf, "HOMEY") == 0) {
@@ -511,25 +579,22 @@ void checkSerialTimeout() {
   }
 
   if (motors_enabled && (millis() - last_serial_time > SERIAL_TIMEOUT_MS)) {
-    target_x_vel = 0.0f;
-    target_y_vel = 0.0f;
+    // Signal Core 1 to stop
+    mutex_enter_blocking(&velocity_mutex);
+    shared_target_x_vel = 0.0f;
+    shared_target_y_vel = 0.0f;
+    new_velocity_available = true;
+    mutex_exit(&velocity_mutex);
   }
 }
 
-// Deadman timeout: zero velocity if no valid command in ~1.5s
-void handleCommandTimeout() {
-  unsigned long now = millis();
-  const unsigned long TIMEOUT_MS = 1500;
-
-  if (now - last_cmd_time > TIMEOUT_MS) {
-    target_x_vel  = 0.0f;
-    target_y_vel  = 0.0f;
-  }
-}
-
-// ======================= SETUP/LOOP =====================
+// ======================= CORE 0 SETUP/LOOP =====================
+// Core 0: Handles serial communication - always responsive
 
 void setup() {
+  // Initialize mutex for inter-core communication
+  mutex_init(&velocity_mutex);
+
   Serial.begin(115200);
   while (!Serial) {}
 
@@ -557,15 +622,38 @@ void setup() {
   config_tmc_driver(drvA);
   check_tmc_connections();
 
-  last_move_time = millis();
-  last_cmd_time  = millis();
+  last_cmd_time = millis();
 
-  Serial.println("READY VELOCITY + HOMEX/HOMEY + CENTERED");
+  Serial.println("READY VELOCITY + HOMEX/HOMEY + CENTERED (DUAL CORE)");
 }
 
 void loop() {
-  processSerial();
-  updateVelocityControl();
+  // Core 0: Only handles serial - never blocked by motor stepping
+  processSerialCore0();
   checkSerialTimeout();
-  //handleCommandTimeout();
+}
+
+// ======================= CORE 1 SETUP/LOOP =====================
+// Core 1: Handles motor stepping - can block without affecting serial
+
+void setup1() {
+  // Wait for Core 0 to finish initialization
+  delay(500);
+  last_move_time = millis();
+}
+
+void loop1() {
+  // Check for new velocity command from Core 0
+  mutex_enter_blocking(&velocity_mutex);
+  if (new_velocity_available) {
+    target_x_vel = shared_target_x_vel;
+    target_y_vel = shared_target_y_vel;
+    new_velocity_available = false;
+    abort_current_motion = false;  // Clear abort flag, we have the new command
+  }
+  mutex_exit(&velocity_mutex);
+
+  // Run the (potentially blocking) velocity control
+  // If a new command arrives, step_corexy_AB_delta will exit early
+  updateVelocityControl();
 }
